@@ -1,0 +1,181 @@
+"""Tests for benchmark instance selection strategies."""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+from sklearn.neighbors import KNeighborsClassifier
+
+from tscf_eval.benchmark.config import DatasetConfig, ModelConfig
+from tscf_eval.benchmark.selection import (
+    _select_random,
+    _select_stratified_confidence,
+    select_instances,
+)
+
+
+@pytest.fixture
+def selection_setup(
+    univariate_data: tuple[np.ndarray, np.ndarray],
+) -> tuple[DatasetConfig, ModelConfig]:
+    """Create dataset and fitted model for selection tests."""
+    X, y = univariate_data
+    X_train, X_test = X[:40], X[40:]
+    y_train, y_test = y[:40], y[40:]
+
+    dataset = DatasetConfig("test", X_train, y_train, X_test, y_test)
+
+    clf = KNeighborsClassifier(n_neighbors=3)
+    clf.fit(X_train, y_train)
+    model = ModelConfig("knn", clf)
+
+    return dataset, model
+
+
+# =============================================================================
+# _select_random
+# =============================================================================
+
+
+class TestSelectRandom:
+    """Tests for random selection."""
+
+    def test_correct_count(self) -> None:
+        """Test that the correct number of indices is returned."""
+        indices = _select_random(100, 10, random_state=42)
+        assert len(indices) == 10
+        assert len(np.unique(indices)) == 10
+
+    def test_reproducible(self) -> None:
+        """Test that results are reproducible with the same seed."""
+        a = _select_random(100, 10, random_state=42)
+        b = _select_random(100, 10, random_state=42)
+        np.testing.assert_array_equal(a, b)
+
+    def test_different_seeds(self) -> None:
+        """Test that different seeds produce different results."""
+        a = _select_random(100, 10, random_state=42)
+        b = _select_random(100, 10, random_state=99)
+        assert not np.array_equal(a, b)
+
+
+# =============================================================================
+# _select_stratified_confidence
+# =============================================================================
+
+
+class TestSelectStratifiedConfidence:
+    """Tests for stratified confidence selection."""
+
+    def test_correct_count(self, selection_setup: tuple[DatasetConfig, ModelConfig]) -> None:
+        """Test that the correct number of indices is returned."""
+        dataset, model = selection_setup
+        indices = _select_stratified_confidence(
+            dataset.X_test, model, n_instances=8, random_state=42
+        )
+        assert len(indices) == 8
+        assert len(np.unique(indices)) == 8
+
+    def test_reproducible(self, selection_setup: tuple[DatasetConfig, ModelConfig]) -> None:
+        """Test that results are reproducible with the same seed."""
+        dataset, model = selection_setup
+        a = _select_stratified_confidence(dataset.X_test, model, n_instances=8, random_state=42)
+        b = _select_stratified_confidence(dataset.X_test, model, n_instances=8, random_state=42)
+        np.testing.assert_array_equal(a, b)
+
+    def test_fallback_no_predict_proba(
+        self, selection_setup: tuple[DatasetConfig, ModelConfig]
+    ) -> None:
+        """Test fallback to random when model lacks predict_proba."""
+        dataset, _ = selection_setup
+
+        class NoProbaCls:
+            def predict(self, X: np.ndarray) -> np.ndarray:
+                return np.zeros(len(X), dtype=int)
+
+        model = ModelConfig("no_proba", NoProbaCls())
+
+        with pytest.warns(UserWarning, match="does not support predict_proba"):
+            indices = _select_stratified_confidence(
+                dataset.X_test, model, n_instances=8, random_state=42
+            )
+        assert len(indices) == 8
+
+    def test_fallback_few_instances(
+        self, selection_setup: tuple[DatasetConfig, ModelConfig]
+    ) -> None:
+        """Test fallback to random when n_instances < number of bins."""
+        dataset, model = selection_setup
+
+        with pytest.warns(UserWarning, match="less than the number of confidence bins"):
+            indices = _select_stratified_confidence(
+                dataset.X_test, model, n_instances=2, random_state=42
+            )
+        assert len(indices) == 2
+
+    def test_uneven_allocation(self, selection_setup: tuple[DatasetConfig, ModelConfig]) -> None:
+        """Test that remainder instances are distributed correctly."""
+        dataset, model = selection_setup
+        # 9 instances across 4 bins: 3+2+2+2 or similar
+        indices = _select_stratified_confidence(
+            dataset.X_test, model, n_instances=9, random_state=42
+        )
+        assert len(indices) == 9
+        assert len(np.unique(indices)) == 9
+
+
+class TestSelectInstances:
+    """Tests for the top-level select_instances dispatcher."""
+
+    def test_none_returns_all(self, selection_setup: tuple[DatasetConfig, ModelConfig]) -> None:
+        """Test that n_instances=None returns all instances."""
+        dataset, model = selection_setup
+        X, y = select_instances(dataset, model, None, "random", 42)
+        assert len(X) == dataset.n_test
+        assert y is not None
+        assert len(y) == dataset.n_test
+
+    def test_n_instances_ge_total(self, selection_setup: tuple[DatasetConfig, ModelConfig]) -> None:
+        """Test that n_instances >= n_test returns all instances."""
+        dataset, model = selection_setup
+        X, _y = select_instances(dataset, model, 999, "random", 42)
+        assert len(X) == dataset.n_test
+
+    def test_random_strategy(self, selection_setup: tuple[DatasetConfig, ModelConfig]) -> None:
+        """Test random strategy returns correct count."""
+        dataset, model = selection_setup
+        X, y = select_instances(dataset, model, 5, "random", 42)
+        assert len(X) == 5
+        assert y is not None
+        assert len(y) == 5
+
+    def test_stratified_confidence_strategy(
+        self, selection_setup: tuple[DatasetConfig, ModelConfig]
+    ) -> None:
+        """Test stratified_confidence strategy returns correct count."""
+        dataset, model = selection_setup
+        X, y = select_instances(dataset, model, 8, "stratified_confidence", 42)
+        assert len(X) == 8
+        assert y is not None
+        assert len(y) == 8
+
+    def test_invalid_strategy_raises(
+        self, selection_setup: tuple[DatasetConfig, ModelConfig]
+    ) -> None:
+        """Test that an invalid strategy raises ValueError."""
+        dataset, model = selection_setup
+        with pytest.raises(ValueError, match="Unknown selection strategy"):
+            select_instances(dataset, model, 5, "invalid_strategy", 42)  # type: ignore[arg-type]
+
+    def test_no_y_test(self) -> None:
+        """Test that y_test=None is handled correctly."""
+        X_train = np.random.randn(20, 50)
+        y_train = np.zeros(20, dtype=int)
+        X_test = np.random.randn(10, 50)
+
+        dataset = DatasetConfig("no_y", X_train, y_train, X_test)
+        model = ModelConfig("dummy", KNeighborsClassifier(n_neighbors=1).fit(X_train, y_train))
+
+        X, y = select_instances(dataset, model, 5, "random", 42)
+        assert len(X) == 5
+        assert y is None

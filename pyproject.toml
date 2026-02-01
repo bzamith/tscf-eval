@@ -1,0 +1,230 @@
+[project]
+name = "tscf-eval"
+version = "0.1.0"
+description = "TSCFEval - A model-agnostic framework for systematic evaluation of counterfactual explanations in time series classification"
+authors = [
+    {name = "Bruna Zamith Santos", email = "bzs@cin.ufpe.br"},
+    {name = "Maira Farias Andrade Lira", email = "mfal@cin.ufpe.br"},
+    {name = "Ricardo Cerri", email = "cerri@icmc.usp.br"},
+    {name = "Ricardo Bastos Cavalcante Prudencio", email = "rbcp@cin.ufpe.br"},
+]
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10,<3.14"
+keywords = [
+    "counterfactual",
+    "explainability",
+    "xai",
+    "time-series",
+    "machine-learning",
+    "classification",
+    "interpretability",
+    "evaluation",
+    "benchmark"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Typing :: Typed",
+]
+dependencies = [
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    "scikit-learn>=1.3.0",
+    "aeon>=1.3.0",
+    "tqdm>=4.65.0",
+    "matplotlib>=3.7.0",
+    "joblib>=1.3.0",
+    "tensorflow (>=2.20.0,<3.0.0)",
+]
+
+[project.optional-dependencies]
+dtw = [
+    "tslearn>=0.6.0",
+]
+tsevo = [
+    "deap>=1.3.0",
+]
+full = [
+    "tslearn>=0.6.0",
+    "stumpy>=1.12.0",
+    "scipy>=1.11.0",
+    "deap>=1.3.0",
+    "adjusttext>=0.8",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.3.0",
+    "mypy>=1.0.0",
+    "pre-commit>=3.0.0",
+    "bandit[toml]>=1.7.0",
+    "deap>=1.3.0",
+]
+docs = [
+    "sphinx>=7.0.0",
+    "sphinx-rtd-theme>=2.0.0",
+    "sphinx-autodoc-typehints>=1.25.0",
+    "myst-parser>=2.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/bzamith/tscf-eval"
+Documentation = "https://tscf-eval.readthedocs.io"
+Repository = "https://github.com/bzamith/tscf-eval"
+Issues = "https://github.com/bzamith/tscf-eval/issues"
+Changelog = "https://github.com/bzamith/tscf-eval/blob/main/CHANGELOG.md"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src/tscf_eval",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tscf_eval"]
+
+# -------------------------------
+# Ruff - Fast Python linter & formatter
+# -------------------------------
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "ARG",    # flake8-unused-arguments
+    "SIM",    # flake8-simplify
+    "TCH",    # flake8-type-checking
+    "PTH",    # flake8-use-pathlib
+    "ERA",    # eradicate (commented-out code)
+    "PL",     # Pylint
+    "RUF",    # Ruff-specific rules
+]
+ignore = [
+    "E501",     # Line too long (handled by formatter)
+    "PLR0913",  # Too many arguments
+    "PLR2004",  # Magic value in comparison
+    "PLR0911",  # Too many return statements
+    "PLR0912",  # Too many branches
+    "PLR0915",  # Too many statements
+    "PLW2901",  # Outer loop variable overwritten
+    "B008",     # Function call in default argument
+    "ARG001",   # Unused function argument (common in base classes)
+    "ARG002",   # Unused method argument
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ARG", "PLC0415", "PLR2004", "S101", "TC002"]
+"__init__.py" = ["F401"]
+# PLC0415: Optional dependency imports inside try/except blocks
+"src/tscf_eval/evaluator/evaluator.py" = ["PLC0415"]
+"src/tscf_eval/evaluator/metrics/distribution.py" = ["PLC0415"]
+"src/tscf_eval/benchmark/multi_criteria.py" = ["PLC0415"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["tscf_eval"]
+force-sort-within-sections = true
+combine-as-imports = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+# -------------------------------
+# MyPy - Type checking
+# -------------------------------
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+show_error_codes = true
+pretty = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+
+# -------------------------------
+# Pytest - Testing
+# -------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+    "--strict-config",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+]
+
+# -------------------------------
+# Coverage - Test coverage
+# -------------------------------
+[tool.coverage.run]
+source = ["src/tscf_eval"]
+branch = true
+parallel = true
+omit = [
+    "*/tests/*",
+    "*/__init__.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]
+fail_under = 70
+show_missing = true
+skip_covered = true
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+# -------------------------------
+# Bandit - Security linting
+# -------------------------------
+[tool.bandit]
+exclude_dirs = ["tests", "docs"]
+skips = ["B101"]  # assert_used (OK in tests)
