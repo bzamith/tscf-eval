@@ -29,7 +29,7 @@ using the :class:`~tscf_eval.Evaluator` class:
    # Create evaluator with desired metrics
    evaluator = Evaluator([
        Validity(),
-       Proximity(p=2),
+       Proximity(p=2, distance="lp"),
        Sparsity(),
    ])
 
@@ -58,10 +58,16 @@ classifier instead of labels:
    # Evaluate using the classifier
    results = evaluator.evaluate(X_test, X_cf, model=clf)
 
+Some metrics require additional inputs:
+
+- ``model``: Validity, Controllability, Confidence
+- ``X_train``: Plausibility, Diversity
+- ``time_per_instance``: Efficiency
+
 Available Metrics
 -----------------
 
-tscf-eval provides 10 metric classes organized into six quality dimensions:
+tscf-eval provides 11 metric classes organized into six quality dimensions:
 
 .. list-table::
    :header-rows: 1
@@ -74,10 +80,10 @@ tscf-eval provides 10 metric classes organized into six quality dimensions:
      - Fraction of CFs that change prediction
      - [0, 1]
    * - Proximity(p)
-     - Mean L-p distance to original
-     - [0, +inf)
+     - Proximity score ``1 / (1 + d)``, where ``d`` is distance
+     - [0, 1]
    * - Sparsity
-     - Fraction of unchanged features
+     - Fraction of changed features
      - [0, 1]
    * - Plausibility
      - Outlier detection score

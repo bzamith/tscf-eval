@@ -75,6 +75,7 @@ class DatasetConfig:
     y_test: np.ndarray | None = None
 
     def __post_init__(self) -> None:
+        """Validate and coerce array fields to numpy arrays."""
         object.__setattr__(self, "X_train", np.asarray(self.X_train))
         object.__setattr__(self, "y_train", np.asarray(self.y_train).ravel())
         object.__setattr__(self, "X_test", np.asarray(self.X_test))
@@ -83,17 +84,35 @@ class DatasetConfig:
 
     @property
     def n_train(self) -> int:
-        """Number of training instances."""
+        """Number of training instances.
+
+        Returns
+        -------
+        int
+            Length of ``X_train`` along axis 0.
+        """
         return len(self.X_train)
 
     @property
     def n_test(self) -> int:
-        """Number of test instances."""
+        """Number of test instances.
+
+        Returns
+        -------
+        int
+            Length of ``X_test`` along axis 0.
+        """
         return len(self.X_test)
 
     @property
     def series_length(self) -> int:
-        """Length of time series."""
+        """Return the length of each time series.
+
+        Returns
+        -------
+        int
+            Last dimension of ``X_train``.
+        """
         return int(self.X_train.shape[-1])
 
 
@@ -126,11 +145,34 @@ class ModelConfig:
     model: Any
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """Predict class labels for samples."""
+        """Predict class labels for samples.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Input instances, shape ``(n_samples, ...)``.
+
+        Returns
+        -------
+        np.ndarray
+            Predicted class labels, shape ``(n_samples,)``.
+        """
         return np.asarray(self.model.predict(X))
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray | None:
-        """Predict class probabilities if available."""
+        """Predict class probabilities if available.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Input instances, shape ``(n_samples, ...)``.
+
+        Returns
+        -------
+        np.ndarray or None
+            Class probabilities of shape ``(n_samples, n_classes)``,
+            or ``None`` if the model lacks ``predict_proba``.
+        """
         if hasattr(self.model, "predict_proba"):
             return np.asarray(self.model.predict_proba(X))
         return None

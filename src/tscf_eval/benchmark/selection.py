@@ -12,11 +12,15 @@ import warnings
 
 import numpy as np
 
+from tscf_eval.counterfactuals.utils import soft_predict_proba_fn
+
 if TYPE_CHECKING:
     from .config import DatasetConfig, ModelConfig
 
 __all__ = [
+    "N_CONFIDENCE_BINS",
     "SelectionStrategy",
+    "compute_confidence_bins",
     "select_instances",
 ]
 
@@ -33,7 +37,7 @@ def select_instances(
     n_instances: int | None,
     strategy: SelectionStrategy,
     random_state: int | None,
-) -> tuple[np.ndarray, np.ndarray | None]:
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
     """Select test instances according to the given strategy.
 
     Parameters
@@ -55,18 +59,29 @@ def select_instances(
         Selected test instances.
     y_test : np.ndarray or None
         Corresponding labels, or None if not available.
+    bin_indices : np.ndarray or None
+        Confidence bin assignment for each selected instance (computed
+        over the full test set), or ``None`` when stratified binning
+        was not performed (e.g. random strategy, no ``predict_proba``,
+        or no subsampling).
     """
     X_test = dataset.X_test
     y_test = dataset.y_test
 
     # No subsampling needed
     if n_instances is None or n_instances >= len(X_test):
-        return X_test, y_test
+        return X_test, y_test, None
 
     if strategy == "random":
         indices = _select_random(len(X_test), n_instances, random_state)
+        bin_indices = None
     elif strategy == "stratified_confidence":
-        indices = _select_stratified_confidence(X_test, model, n_instances, random_state)
+        indices, bin_indices = _select_stratified_confidence(
+            X_test,
+            model,
+            n_instances,
+            random_state,
+        )
     else:
         raise ValueError(
             f"Unknown selection strategy: {strategy!r}. "
@@ -77,7 +92,7 @@ def select_instances(
     if y_test is not None:
         y_test = y_test[indices]
 
-    return X_test, y_test
+    return X_test, y_test, bin_indices
 
 
 def _select_random(
@@ -110,7 +125,7 @@ def _select_stratified_confidence(
     model: ModelConfig,
     n_instances: int,
     random_state: int | None,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray | None]:
     """Select instances stratified by model confidence.
 
     Computes model confidence (max predicted probability) for each
@@ -135,8 +150,12 @@ def _select_stratified_confidence(
 
     Returns
     -------
-    np.ndarray
+    indices : np.ndarray
         Array of selected indices.
+    bin_indices : np.ndarray or None
+        Confidence bin assignment for each selected instance (computed
+        over the full test set), or ``None`` when falling back to
+        random selection.
     """
     # Guard: need at least one instance per bin for stratification
     if n_instances < N_CONFIDENCE_BINS:
@@ -147,32 +166,35 @@ def _select_stratified_confidence(
             UserWarning,
             stacklevel=3,
         )
-        return _select_random(len(X_test), n_instances, random_state)
+        return _select_random(len(X_test), n_instances, random_state), None
 
-    # Guard: model must support predict_proba
-    proba = model.predict_proba(X_test)
-    if proba is None:
+    # Get soft probabilities for confidence estimation.
+    # Some classifiers (ROCKET, RDST) use RidgeClassifierCV internally and
+    # return hard 0/1 from predict_proba, making all confidences identical.
+    # soft_predict_proba_fn converts decision_function outputs to smooth
+    # probabilities via sigmoid/softmax, giving meaningful confidence spread.
+    # For classifiers with native smooth predict_proba (LR, MLP, deep
+    # learning) it falls through to predict_proba unchanged.
+    confidence = _get_soft_confidence(X_test, model)
+    if confidence is None:
         warnings.warn(
             f"Model '{model.name}' does not support predict_proba. "
             f"Falling back to random instance selection.",
             UserWarning,
             stacklevel=3,
         )
-        return _select_random(len(X_test), n_instances, random_state)
-
-    # Confidence = max predicted probability per instance
-    confidence = np.max(proba, axis=1)
+        return _select_random(len(X_test), n_instances, random_state), None
 
     # Create quantile-based bin edges (4 bins: 0-25%, 25-50%, 50-75%, 75-100%)
     quantiles = np.linspace(0, 1, N_CONFIDENCE_BINS + 1)
     bin_edges = np.quantile(confidence, quantiles)
 
-    # Assign each instance to a bin
+    # Assign each instance to a bin (over full test set)
     # np.digitize with bin_edges[1:-1] maps to bins 0..N_CONFIDENCE_BINS-1
-    bin_indices = np.digitize(confidence, bin_edges[1:-1], right=True)
+    bin_indices_full = np.digitize(confidence, bin_edges[1:-1], right=True)
 
     # Collect indices per bin
-    bins: list[np.ndarray] = [np.where(bin_indices == b)[0] for b in range(N_CONFIDENCE_BINS)]
+    bins: list[np.ndarray] = [np.where(bin_indices_full == b)[0] for b in range(N_CONFIDENCE_BINS)]
 
     # Compute per-bin allocation
     base_per_bin = n_instances // N_CONFIDENCE_BINS
@@ -210,4 +232,89 @@ def _select_stratified_confidence(
             extra = rng.choice(remaining, size=min(deficit, len(remaining)), replace=False)
             selected.append(extra)
 
-    return np.concatenate(selected)
+    indices = np.concatenate(selected)
+    return indices, bin_indices_full[indices]
+
+
+def compute_confidence_bins(
+    X_test: np.ndarray,
+    model: ModelConfig,
+) -> np.ndarray | None:
+    """Compute confidence quartile bin assignments for given instances.
+
+    Uses the same quantile-based binning as
+    :func:`_select_stratified_confidence`: confidence is defined as
+    ``max(predict_proba)`` per instance, then split into
+    :data:`N_CONFIDENCE_BINS` equal-frequency bins.
+
+    Parameters
+    ----------
+    X_test : np.ndarray
+        Test instances (already selected).
+    model : ModelConfig
+        Fitted model with optional ``predict_proba`` support.
+
+    Returns
+    -------
+    np.ndarray or None
+        Integer array of shape ``(len(X_test),)`` with values in
+        ``{0, 1, ..., N_CONFIDENCE_BINS - 1}`` where 0 is the
+        lowest-confidence bin. Returns ``None`` if the model does not
+        support ``predict_proba``.
+    """
+    confidence = _get_soft_confidence(X_test, model)
+    if confidence is None:
+        return None
+
+    quantiles = np.linspace(0, 1, N_CONFIDENCE_BINS + 1)
+    bin_edges = np.quantile(confidence, quantiles)
+    bin_indices: np.ndarray = np.digitize(confidence, bin_edges[1:-1], right=True)
+
+    return bin_indices
+
+
+def _get_soft_confidence(
+    X_test: np.ndarray,
+    model: ModelConfig,
+) -> np.ndarray | None:
+    """Compute per-instance confidence using soft probabilities.
+
+    Uses :func:`soft_predict_proba_fn` so that classifiers with hard 0/1
+    ``predict_proba`` (e.g. ROCKET, RDST with ``RidgeClassifierCV``) are
+    converted to smooth probabilities via their ``decision_function``.
+    Classifiers with native smooth ``predict_proba`` (logistic regression,
+    MLP, deep learning) pass through unchanged.
+
+    Parameters
+    ----------
+    X_test : np.ndarray
+        Test instances.
+    model : ModelConfig
+        Fitted model wrapper.
+
+    Returns
+    -------
+    np.ndarray or None
+        Max predicted probability per instance, or ``None`` if the model
+        supports neither ``predict_proba`` nor ``decision_function``.
+    """
+    # Try soft_predict_proba_fn first (handles ROCKET/RDST decision_function)
+    try:
+        soft_proba = soft_predict_proba_fn(model.model)
+        proba_arr: np.ndarray = np.asarray(soft_proba(X_test))
+        confidence: np.ndarray = np.max(proba_arr, axis=1)
+        return confidence
+    except (TypeError, AttributeError, ValueError) as exc:
+        warnings.warn(
+            f"soft_predict_proba_fn failed for model '{model.name}': {exc}. "
+            f"Falling back to raw predict_proba for confidence estimation.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    # Fallback to raw predict_proba
+    raw_proba = model.predict_proba(X_test)
+    if raw_proba is None:
+        return None
+    fallback_confidence: np.ndarray = np.max(raw_proba, axis=1)
+    return fallback_confidence

@@ -8,11 +8,14 @@ soft_predict_proba_fn
     Wraps a classifier to provide soft probabilities for gradient-based methods.
 supports_soft_probabilities
     Check if a classifier supports smooth probability estimates for gradients.
+has_expensive_transform
+    Check if a classifier has an expensive internal transform pipeline.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+import warnings
 
 import numpy as np
 
@@ -20,7 +23,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
-def predict_proba_fn(model) -> Callable[[np.ndarray], np.ndarray]:
+def predict_proba_fn(model: Any) -> Callable[[np.ndarray], np.ndarray]:
     """Wrap a classifier's ``predict_proba`` to accept array-like inputs.
 
     Parameters
@@ -36,6 +39,18 @@ def predict_proba_fn(model) -> Callable[[np.ndarray], np.ndarray]:
     """
 
     def _predict(X: np.ndarray) -> np.ndarray:
+        """Return class probabilities for *X* via the wrapped model.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Input array of shape ``(N, ...)`` accepted by the model.
+
+        Returns
+        -------
+        np.ndarray
+            Probability matrix of shape ``(N, n_classes)``.
+        """
         result: np.ndarray = model.predict_proba(np.asarray(X))
         return result
 
@@ -43,7 +58,7 @@ def predict_proba_fn(model) -> Callable[[np.ndarray], np.ndarray]:
 
 
 def soft_predict_proba_fn(
-    model, temperature: float | None = None
+    model: Any, temperature: float | None = None
 ) -> Callable[[np.ndarray], np.ndarray]:
     """Wrap a classifier to provide soft (smooth) probability estimates.
 
@@ -103,6 +118,13 @@ def soft_predict_proba_fn(
         return _make_decision_fn_soft_proba(model, temperature=temperature)
 
     # Fall back to regular predict_proba (may not be smooth!)
+    warnings.warn(
+        f"Model {type(model).__name__} does not have a decision_function. "
+        f"soft_predict_proba_fn() is falling back to raw predict_proba, which may "
+        f"return hard 0/1 probabilities unsuitable for gradient-based optimization.",
+        UserWarning,
+        stacklevel=2,
+    )
     return predict_proba_fn(model)
 
 
@@ -134,7 +156,7 @@ def _calibrate_from_decision_values(decision: np.ndarray, target_range: float = 
     return 1.0
 
 
-def supports_soft_probabilities(model) -> bool:
+def supports_soft_probabilities(model: Any) -> bool:
     """Check if a classifier supports smooth probability estimates.
 
     Gradient-based counterfactual methods (Glacier, LatentCF) require classifiers
@@ -197,13 +219,91 @@ def supports_soft_probabilities(model) -> bool:
         if "Forest" in estimator_name or "Tree" in estimator_name:
             return False
 
+    # Known classifiers with native smooth predict_proba (no decision_function
+    # needed because their probabilities are already smooth/distance-based)
+    smooth_proba_classifiers = {
+        "KNeighborsClassifier",
+        "KNeighborsTimeSeriesClassifier",
+        "LogisticRegression",
+        "GaussianNB",
+        "MLPClassifier",
+    }
+    if class_name in smooth_proba_classifiers:
+        return True
+
+    # Check if model has predict_proba (heuristic: if it does, assume smooth)
+    if hasattr(model, "predict_proba"):
+        return True
+
     # Default: assume soft probabilities are available
     # (may still fail at runtime, but we can't know for sure)
+    warnings.warn(
+        f"Cannot determine if {type(model).__name__} supports soft probabilities. "
+        f"Assuming True; gradient-based methods may fail at runtime if the model "
+        f"returns discrete probabilities.",
+        UserWarning,
+        stacklevel=2,
+    )
     return True
 
 
+def has_expensive_transform(model: Any) -> bool:
+    """Check if a classifier has an expensive internal transform pipeline.
+
+    Gradient-based counterfactual methods (CELS, Glacier, LatentCF) compute
+    finite-difference gradients by calling ``predict_proba`` many times per
+    iteration. For classifiers with expensive transform pipelines (e.g. ROCKET
+    convolves with thousands of random kernels, RDST computes shapelet
+    distances), each call triggers the full transform, making the gradient
+    loop very slow.
+
+    When this returns True, the gradient subsample floor (``n_features // 2``)
+    is skipped so the user-specified ``gradient_subsample`` is respected,
+    reducing the number of expensive transform calls per iteration.
+
+    Parameters
+    ----------
+    model : object
+        A fitted classifier.
+
+    Returns
+    -------
+    bool
+        True if the classifier has an expensive transform pipeline.
+    """
+    class_name = type(model).__name__
+
+    # Known classifiers with expensive internal transforms
+    expensive_classifiers = {
+        "RocketClassifier",
+        "MiniRocketClassifier",
+        "MultiRocketClassifier",
+        "RDSTClassifier",
+        "Arsenal",
+        "TSFreshClassifier",
+        "TimeSeriesForestClassifier",
+    }
+
+    if class_name in expensive_classifiers:
+        return True
+
+    # Check for pipeline-style classifiers with expensive transformers
+    if hasattr(model, "_transformer"):
+        transformer_name = type(model._transformer).__name__
+        expensive_transformers = {
+            "Rocket",
+            "MiniRocket",
+            "MultiRocket",
+            "RandomDilatedShapeletTransform",
+        }
+        if transformer_name in expensive_transformers:
+            return True
+
+    return False
+
+
 def _make_rocket_soft_proba(
-    model, temperature: float | None = None
+    model: Any, temperature: float | None = None
 ) -> Callable[[np.ndarray], np.ndarray]:
     """Create soft proba function for ROCKET-style classifiers.
 
@@ -233,6 +333,18 @@ def _make_rocket_soft_proba(
     state: dict[str, float | None] = {"temperature": temperature}
 
     def _soft_predict(X: np.ndarray) -> np.ndarray:
+        """Return soft probabilities via the ROCKET pipeline and sigmoid/softmax.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Input array of shape ``(N, ...)`` accepted by the pipeline.
+
+        Returns
+        -------
+        np.ndarray
+            Soft probability matrix of shape ``(N, n_classes)``.
+        """
         X = np.asarray(X)
         # Transform through the full pipeline (Rocket + StandardScaler + ...)
         if pipeline_steps is not None:
@@ -266,7 +378,7 @@ def _make_rocket_soft_proba(
 
 
 def _make_decision_fn_soft_proba(
-    model, temperature: float | None = None
+    model: Any, temperature: float | None = None
 ) -> Callable[[np.ndarray], np.ndarray]:
     """Create soft proba function using model's decision_function.
 
@@ -286,6 +398,18 @@ def _make_decision_fn_soft_proba(
     state: dict[str, float | None] = {"temperature": temperature}
 
     def _soft_predict(X: np.ndarray) -> np.ndarray:
+        """Return soft probabilities via ``decision_function`` and sigmoid/softmax.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Input array of shape ``(N, ...)`` accepted by the model.
+
+        Returns
+        -------
+        np.ndarray
+            Soft probability matrix of shape ``(N, n_classes)``.
+        """
         X = np.asarray(X)
         decision = model.decision_function(X)
 
@@ -306,7 +430,18 @@ def _make_decision_fn_soft_proba(
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
-    """Numerically stable sigmoid function."""
+    """Apply the numerically stable sigmoid function element-wise.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        Input array of any shape.
+
+    Returns
+    -------
+    np.ndarray
+        Element-wise sigmoid values in ``(0, 1)``, same shape as *x*.
+    """
     # Use np.clip to avoid overflow warnings
     x = np.clip(x, -500, 500)
     result: np.ndarray = 1.0 / (1.0 + np.exp(-x))
@@ -314,7 +449,18 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
 
 
 def _softmax(x: np.ndarray) -> np.ndarray:
-    """Numerically stable softmax function."""
+    """Apply the numerically stable softmax function row-wise.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        Input array of shape ``(N, C)`` where *C* is the number of classes.
+
+    Returns
+    -------
+    np.ndarray
+        Row-wise softmax probabilities of shape ``(N, C)``.
+    """
     # Subtract max for numerical stability
     x_shifted = x - np.max(x, axis=1, keepdims=True)
     exp_x = np.exp(x_shifted)

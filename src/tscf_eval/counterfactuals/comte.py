@@ -76,6 +76,8 @@ from .utils import (
     strip_batch,
 )
 
+_MIN_GAIN = 1e-9
+
 
 @dataclass
 class COMTE(Counterfactual):
@@ -93,10 +95,10 @@ class COMTE(Counterfactual):
 
         L = max(0, tau - f_c)^2 + lambda_reg * max(0, n_vars - delta)
 
-    Supported distances
-    -------------------
-    - 'dtw' : multivariate DTW via ``dtw_distance_vec_multich``
-    - 'euclidean' : Euclidean distance using flattened pairwise distances
+    **Supported distances:**
+
+    - ``'dtw'`` : multivariate DTW via ``dtw_distance_vec_multich``
+    - ``'euclidean'`` : Euclidean distance using flattened pairwise distances
 
     Parameters
     ----------
@@ -104,10 +106,15 @@ class COMTE(Counterfactual):
         A classifier with a probability estimator (``predict_proba`` or a
         compatible interface). The helper ``predict_proba_fn`` wraps model
         inference.
-    data : tuple (X_ref, y_ref)
+    data : tuple (``X_ref``, ``y_ref``)
         Reference dataset used to select distractors.
-    distance : {'euclidean', 'dtw'}
+    distance : {'euclidean', 'dtw'}, default 'dtw'
         Distance metric to find nearest distractors.
+
+        - ``'euclidean'``: Euclidean distance on flattened vectors. Faster but
+          ignores temporal alignment.
+        - ``'dtw'``: Dynamic Time Warping distance (per-channel, averaged).
+          Respects temporal shifts and is recommended for time series.
     n_distractors : int
         Maximum number of distractors to try.
     tau : float
@@ -136,11 +143,38 @@ class COMTE(Counterfactual):
     random_state: int | None = 0
 
     def __post_init__(self):
+        """Initialise probability wrapper, RNG, reference data, and label mapping.
+
+        Validates all hyperparameters and pre-computes reference-set
+        predictions to avoid redundant calls during distractor selection.
+
+        Raises
+        ------
+        ValueError
+            If ``distance`` is not in ``{'euclidean', 'dtw'}``,
+            ``n_distractors < 1``, ``tau`` is outside ``(0, 1]``,
+            ``delta < 1``, or ``lambda_reg < 0``.
+        """
+        # Validate parameters
+        if self.distance not in ("euclidean", "dtw"):
+            raise ValueError("distance must be one of {'euclidean', 'dtw'}")
+        if self.n_distractors < 1:
+            raise ValueError("n_distractors must be >= 1")
+        if not (0.0 < self.tau <= 1.0):
+            raise ValueError("tau must be in (0, 1]")
+        if self.delta < 1:
+            raise ValueError("delta must be >= 1")
+        if self.lambda_reg < 0:
+            raise ValueError("lambda_reg must be >= 0")
+
         self.predict_proba = soft_predict_proba_fn(self.model)
         self.rng = np.random.default_rng(self.random_state)
         self.X_ref = np.asarray(self.data[0])
         self.y_ref = np.asarray(self.data[1]).ravel()
-        # Pre-compute reference set predictions to avoid redundant calls in _select_distractors
+
+        self._init_label_mapping(self.model, self.y_ref)
+
+        # Pre-compute reference set predictions to avoid redundant calls
         self._ref_probs = self.predict_proba(self.X_ref)
         self._ref_yhat = np.argmax(self._ref_probs, axis=1)
 
@@ -186,74 +220,25 @@ class COMTE(Counterfactual):
         xb, added = ensure_batch_shape(x)
         x1 = strip_batch(xb, added)
 
-        # Determine base prediction and target class c
         base_probs = self.predict_proba(xb)[0]
-        base_label = int(np.argmax(base_probs)) if y_pred is None else int(y_pred)
+        base_idx = int(np.argmax(base_probs)) if y_pred is None else self._label_to_idx(y_pred)
+        target_idx = self._resolve_target_class(base_probs, base_idx, class_of_interest)
 
-        if class_of_interest is None:
-            # choose the best alternative class (highest prob not equal to base)
-            probs_sorted = np.argsort(-base_probs)
-            class_of_interest = int(next(c for c in probs_sorted if c != base_label))
+        # Step 1: Find distractor candidates predicted as the target class
+        distractor_meta, distractors = self._find_target_class_distractors(x1, target_idx)
 
-        # 1) choose distractor candidates predicted as the class of interest
-        dmeta, distractors = self._select_distractors(x1, class_of_interest)
+        # Step 2: Greedy channel swap per distractor, keep the best
+        best = self._select_best_distractor_result(x1, distractors, target_idx)
 
-        # 2) run greedy search per distractor and pick the best by loss
-        best = None
-        for i, distractor in enumerate(distractors):
-            cf, edits, fc = self._greedy_channel_search(x1, distractor, class_of_interest)
-            loss = self._compute_loss(fc, len(edits))
-            item = (loss, i, cf, edits, fc)
-            if (best is None) or (loss < best[0]):
-                best = item
-
-        # Fallback if no distractors found: return x unchanged
+        # Step 3: Assemble result
         if best is None:
-            warnings.warn(
-                f"COMTE: No distractors found for target class {class_of_interest}. "
-                f"This typically occurs when the classifier predicts all reference "
-                f"samples as the same class (base class={base_label}). The original "
-                f"instance is returned unchanged. Consider using a different dataset "
-                f"or a classifier with more diverse predictions.",
-                UserWarning,
-                stacklevel=2,
-            )
-            return (
-                x1,
-                int(base_label),
-                {
-                    "method": "comte_greedy",
-                    "distance": self.distance,
-                    "class_of_interest": class_of_interest,
-                    "validity": False,
-                    "failure_reason": "no_distractors",
-                    "note": "no distractors found; returning original unchanged",
-                    "tau": self.tau,
-                    "delta": self.delta,
-                    "lambda": self.lambda_reg,
-                },
-            )
+            return self._no_distractor_fallback(x1, base_idx, target_idx)
 
         loss, i, cf, edits, fc = best
-        final_label = int(np.argmax(self.predict_proba(cf[None, ...])[0]))
-
-        meta: dict[str, Any] = {
-            "method": "comte_greedy",
-            "distance": self.distance,
-            "class_of_interest": class_of_interest,
-            "tau": float(self.tau),
-            "delta": int(self.delta),
-            # keep backwards-compatible key name 'lambda' but also expose
-            # explicit 'lambda_reg' to avoid confusion with the Python keyword
-            "lambda": float(self.lambda_reg),
-            "lambda_reg": float(self.lambda_reg),
-            "distractor_index_in_ref": (dmeta["indices"][i] if dmeta["indices"] else None),
-            "distractor_distance": (dmeta["distances"][i] if dmeta["distances"] else None),
-            "edits_variables": edits,  # list[int] of channels swapped
-            "target_prob": float(fc),
-            "loss": float(loss),
-        }
-        return cf, final_label, meta
+        cf_idx = self._predict_class_idx(cf)
+        cf_label = self._idx_to_label(cf_idx)
+        meta = self._build_meta(target_idx, distractor_meta, i, edits, fc, loss)
+        return cf, cf_label, meta
 
     def explain_k(
         self,
@@ -293,22 +278,18 @@ class COMTE(Counterfactual):
         xb, added = ensure_batch_shape(x)
         x1 = strip_batch(xb, added)
 
-        # Determine base prediction and target class
         base_probs = self.predict_proba(xb)[0]
-        base_label = int(np.argmax(base_probs)) if y_pred is None else int(y_pred)
+        base_idx = int(np.argmax(base_probs)) if y_pred is None else self._label_to_idx(y_pred)
+        target_idx = self._resolve_target_class(base_probs, base_idx, class_of_interest)
 
-        if class_of_interest is None:
-            probs_sorted = np.argsort(-base_probs)
-            class_of_interest = int(next(c for c in probs_sorted if c != base_label))
-
-        # Get all distractors (request more than k to have options)
+        # Step 1: Get distractors (request more than k to have options)
         orig_n_distractors = self.n_distractors
         self.n_distractors = max(k * 2, orig_n_distractors)
-        dmeta, distractors = self._select_distractors(x1, class_of_interest)
+        distractor_meta, distractors = self._find_target_class_distractors(x1, target_idx)
         self.n_distractors = orig_n_distractors
 
         if not distractors:
-            # No distractors found - return k copies of original with failure metadata
+            base_label = self._idx_to_label(base_idx)
             cfs = np.array([x1 for _ in range(k)])
             cf_labels = np.array([base_label for _ in range(k)])
             metas = [
@@ -322,29 +303,21 @@ class COMTE(Counterfactual):
             ]
             return cfs, cf_labels, metas
 
-        # Generate CF for each distractor (up to k)
-        results: list[tuple[np.ndarray, int, dict[str, Any]]] = []
+        # Step 2: Generate a counterfactual per distractor (up to k)
+        results: list[tuple[np.ndarray, Any, dict[str, Any]]] = []
         for i, distractor in enumerate(distractors[:k]):
-            cf, edits, fc = self._greedy_channel_search(x1, distractor, class_of_interest)
+            cf, edits, fc = self._swap_channels_greedily(x1, distractor, target_idx)
             loss = self._compute_loss(fc, len(edits))
-            final_label = int(np.argmax(self.predict_proba(cf[None, ...])[0]))
-            meta = {
-                "method": "comte_greedy",
-                "k_index": i,
-                "distance": self.distance,
-                "class_of_interest": class_of_interest,
-                "distractor_index_in_ref": dmeta["indices"][i] if dmeta["indices"] else None,
-                "distractor_distance": dmeta["distances"][i] if dmeta["distances"] else None,
-                "edits_variables": edits,
-                "target_prob": float(fc),
-                "loss": float(loss),
-            }
-            results.append((cf, final_label, meta))
+            cf_idx = self._predict_class_idx(cf)
+            meta = self._build_meta(target_idx, distractor_meta, i, edits, fc, loss, k_index=i)
+            results.append((cf, self._idx_to_label(cf_idx), meta))
 
-        # If we have fewer than k distractors, pad with best result
+        # Step 3: Pad with best result if fewer than k distractors
         while len(results) < k:
-            # Repeat the best (lowest loss) result
-            best_idx = min(range(len(results)), key=lambda j: float(results[j][2]["loss"]))
+            best_idx = min(
+                range(len(results)),
+                key=lambda j: float(results[j][2]["loss"]),
+            )
             cf, label, meta = results[best_idx]
             new_meta = meta.copy()
             new_meta["k_index"] = len(results)
@@ -357,17 +330,23 @@ class COMTE(Counterfactual):
 
         return cfs, cf_labels, metas
 
-    def _select_distractors(self, x: np.ndarray, c: int) -> tuple[dict[str, Any], list[np.ndarray]]:
-        """Select distractor candidates from the reference set.
+    def _find_target_class_distractors(
+        self, x: np.ndarray, target_idx: int
+    ) -> tuple[dict[str, Any], list[np.ndarray]]:
+        """Find distractor candidates from the reference set.
 
-        Finds instances in the reference set that are predicted as the target
-        class and ranks them by distance to the query.
+        Selects instances predicted as the target class, ranked by distance
+        to the query. Uses a cascading fallback strategy:
+
+        1. Correctly-classified instances of the target class.
+        2. Any instance predicted as the target class.
+        3. Any instance with ground-truth target class label.
 
         Parameters
         ----------
         x : np.ndarray
             Query time series of shape ``(T,)`` or ``(C, T)``.
-        c : int
+        target_idx : int
             Target class index.
 
         Returns
@@ -377,21 +356,26 @@ class COMTE(Counterfactual):
             ``'distances'`` (distances to query).
         distractors : list of np.ndarray
             List of distractor time series arrays.
+
+        Raises
+        ------
+        ValueError
+            If ``X_ref`` has fewer than 2 or more than 3 dimensions.
         """
         if self.X_ref.ndim not in (2, 3):
             raise ValueError(f"Unsupported X_ref shape {self.X_ref.shape}")
 
-        # Use pre-computed reference set predictions (computed once in __post_init__)
         yhat = self._ref_yhat
+        target_label = self._idx_to_label(target_idx)
 
-        # Paper: choose training instances that are *correctly classified* as class c
-        mask = (self.y_ref == c) & (yhat == c)
+        # Primary: correctly-classified instances of target class
+        mask = (self.y_ref == target_label) & (yhat == target_idx)
         if not np.any(mask):
-            # fallback 1: keep predicted==c only
-            mask = yhat == c
+            # Fallback A: any instance predicted as target class
+            mask = yhat == target_idx
         if not np.any(mask):
-            # fallback 2: keep ground-truth==c only
-            mask = self.y_ref == c
+            # Fallback B: any instance with ground-truth target class
+            mask = self.y_ref == target_label
         if not np.any(mask):
             return {"indices": [], "distances": []}, []
 
@@ -415,40 +399,110 @@ class COMTE(Counterfactual):
             "distances": [float(dvec[j]) for j in picks],
         }, distractors
 
-    def _greedy_channel_search(
-        self, x: np.ndarray, distractor: np.ndarray, target_class: int
-    ) -> tuple[np.ndarray, list[int], float]:
-        """Greedily select channels to swap for maximum target class probability.
-
-        At each step, selects the channel whose substitution from the distractor
-        most increases the target class probability. Stops when probability
-        reaches tau or no further improvement is possible.
+    def _select_best_distractor_result(
+        self,
+        x: np.ndarray,
+        distractors: list[np.ndarray],
+        target_idx: int,
+    ) -> tuple[float, int, np.ndarray, list[int], float] | None:
+        """Run greedy channel swap per distractor, return the best by loss.
 
         Parameters
         ----------
         x : np.ndarray
-            Original time series of shape (T,) or (C, T).
+            Query time series.
+        distractors : list of np.ndarray
+            Distractor candidates.
+        target_idx : int
+            Target class index.
+
+        Returns
+        -------
+        tuple or None
+            ``(loss, distractor_index, cf, edits, target_prob)`` for the
+            best distractor, or ``None`` if no distractors were provided.
+        """
+        best = None
+        for i, distractor in enumerate(distractors):
+            cf, edits, fc = self._swap_channels_greedily(x, distractor, target_idx)
+            loss = self._compute_loss(fc, len(edits))
+            item = (loss, i, cf, edits, fc)
+            if best is None or loss < best[0]:
+                best = item
+        return best
+
+    def _swap_channels_greedily(
+        self, x: np.ndarray, distractor: np.ndarray, target_idx: int
+    ) -> tuple[np.ndarray, list[int], float]:
+        """Greedily swap channels from distractor to maximize target class probability.
+
+        At each step, selects the channel whose substitution most increases
+        the target class probability. Stops when probability reaches tau or
+        no further improvement is possible.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Original time series of shape ``(T,)`` or ``(C, T)``.
         distractor : np.ndarray
-            Distractor series to copy channels from, same shape as x.
-        target_class : int
+            Distractor series to copy channels from, same shape as ``x``.
+        target_idx : int
             Target class index to optimize probability for.
 
         Returns
         -------
-        tuple
-            (counterfactual, edited_channels, final_target_prob)
+        cf : np.ndarray
+            Counterfactual series.
+        edited_channels : list of int
+            Channel indices swapped, in order.
+        target_prob : float
+            Final probability of the target class.
         """
+        # Univariate short-circuit: single swap-or-not decision
         if x.ndim == 1:
-            return self._greedy_search_univariate(x, distractor, target_class)
-        return self._greedy_search_multivariate(x, distractor, target_class)
+            return self._try_univariate_swap(x, distractor, target_idx)
 
-    def _greedy_search_univariate(
-        self, x: np.ndarray, distractor: np.ndarray, target_class: int
+        C, _ = x.shape
+        edited: list[int] = []
+        cf = x.copy()
+        current_prob = self._predict_target_prob(cf, target_idx)
+
+        # Only consider channels where the distractor actually differs
+        remaining = {c for c in range(C) if not np.array_equal(x[c, :], distractor[c, :])}
+
+        while current_prob < self.tau and remaining:
+            # Step A: Find the channel swap with the highest probability gain
+            best_ch, best_prob, best_gain = self._find_best_channel_swap(
+                cf, distractor, target_idx, remaining, current_prob
+            )
+
+            # Step B: If no gain, try fallback (single swap minimizing loss)
+            if best_ch is None or best_gain <= _MIN_GAIN:
+                if not edited:
+                    fallback = self._try_fallback_swap(
+                        cf, distractor, target_idx, remaining, current_prob
+                    )
+                    if fallback is not None:
+                        ch, prob = fallback
+                        cf[ch, :] = distractor[ch, :]
+                        edited.append(ch)
+                        remaining.remove(ch)
+                        current_prob = prob
+                        continue
+                break
+
+            # Step C: Commit the best channel swap
+            cf[best_ch, :] = distractor[best_ch, :]
+            edited.append(best_ch)
+            remaining.remove(best_ch)
+            current_prob = best_prob
+
+        return cf, edited, current_prob
+
+    def _try_univariate_swap(
+        self, x: np.ndarray, distractor: np.ndarray, target_idx: int
     ) -> tuple[np.ndarray, list[int], float]:
-        """Greedy search for univariate series.
-
-        For univariate data (single channel), compares swapping the entire
-        series vs keeping original, choosing whichever minimizes the loss.
+        """Try swapping the entire univariate series, keep if loss improves.
 
         Parameters
         ----------
@@ -456,119 +510,192 @@ class COMTE(Counterfactual):
             Original univariate time series of shape ``(T,)``.
         distractor : np.ndarray
             Distractor series of shape ``(T,)``.
-        target_class : int
-            Target class index to optimize probability for.
+        target_idx : int
+            Target class index.
 
         Returns
         -------
         cf : np.ndarray
             Counterfactual series of shape ``(T,)``.
         edited_channels : list of int
-            List of edited channel indices (``[0]`` if swapped, ``[]`` if not).
+            ``[0]`` if swapped, ``[]`` if not.
         target_prob : float
             Final probability of the target class.
         """
-        base_prob = float(self.predict_proba(x[None, ...])[0][target_class])
-        cf_candidate = distractor.copy()
-        cf_prob = float(self.predict_proba(cf_candidate[None, ...])[0][target_class])
+        if np.array_equal(x, distractor):
+            base_prob = self._predict_target_prob(x, target_idx)
+            return x.copy(), [], base_prob
 
-        loss_orig = self._compute_loss(base_prob, 0)
-        loss_swap = self._compute_loss(cf_prob, 1)
+        base_prob = self._predict_target_prob(x, target_idx)
+        cf_prob = self._predict_target_prob(distractor, target_idx)
 
-        if loss_swap < loss_orig:
-            return cf_candidate, [0], cf_prob
+        if self._compute_loss(cf_prob, 1) < self._compute_loss(base_prob, 0):
+            return distractor.copy(), [0], cf_prob
         return x.copy(), [], base_prob
 
-    def _greedy_search_multivariate(
-        self, x: np.ndarray, distractor: np.ndarray, target_class: int
-    ) -> tuple[np.ndarray, list[int], float]:
-        """Greedy search across channels for multivariate series.
-
-        Iteratively selects the channel swap that most increases the target
-        class probability, stopping when probability reaches tau or no
-        further improvement is possible.
+    def _find_best_channel_swap(
+        self,
+        cf: np.ndarray,
+        distractor: np.ndarray,
+        target_idx: int,
+        remaining: set[int],
+        current_prob: float,
+    ) -> tuple[int | None, float, float]:
+        """Evaluate all remaining channels, return the best swap.
 
         Parameters
         ----------
-        x : np.ndarray
-            Original multivariate time series of shape ``(C, T)``.
+        cf : np.ndarray
+            Current counterfactual of shape ``(C, T)``.
         distractor : np.ndarray
             Distractor series of shape ``(C, T)``.
-        target_class : int
-            Target class index to optimize probability for.
+        target_idx : int
+            Target class index.
+        remaining : set of int
+            Channel indices still available for swapping.
+        current_prob : float
+            Current target class probability.
 
         Returns
         -------
-        cf : np.ndarray
-            Counterfactual series of shape ``(C, T)``.
-        edited_channels : list of int
-            List of edited channel indices in order of selection.
-        target_prob : float
-            Final probability of the target class.
+        best_channel : int or None
+            Channel with the highest gain, or ``None`` if set is empty.
+        best_prob : float
+            Probability after swapping ``best_channel``.
+        best_gain : float
+            Probability gain from the swap.
         """
-        C, _ = x.shape
-        edited_channels: list[int] = []
-        cf = x.copy()
-        current_prob = float(self.predict_proba(cf[None, ...])[0][target_class])
+        best_gain = -np.inf
+        best_channel = None
+        best_prob = current_prob
 
-        remaining_channels = set(range(C))
-        MIN_GAIN = 1e-9
+        for ch in remaining:
+            candidate = cf.copy()
+            candidate[ch, :] = distractor[ch, :]
+            prob = self._predict_target_prob(candidate, target_idx)
+            gain = prob - current_prob
+            if gain > best_gain:
+                best_gain = gain
+                best_channel = ch
+                best_prob = prob
 
-        while current_prob < self.tau and remaining_channels:
-            best_gain = -np.inf
-            best_channel = None
-            best_prob = current_prob
+        return best_channel, best_prob, best_gain
 
-            for channel in list(remaining_channels):
-                candidate = cf.copy()
-                candidate[channel, :] = distractor[channel, :]
-                candidate_prob = float(self.predict_proba(candidate[None, ...])[0][target_class])
-                gain = candidate_prob - current_prob
-                if gain > best_gain:
-                    best_gain = gain
-                    best_channel = channel
-                    best_prob = candidate_prob
+    def _try_fallback_swap(
+        self,
+        cf: np.ndarray,
+        distractor: np.ndarray,
+        target_idx: int,
+        remaining: set[int],
+        current_prob: float,
+    ) -> tuple[int, float] | None:
+        """When no channel gives positive gain, try the swap that minimizes loss.
 
-            if best_channel is None or best_gain <= MIN_GAIN:
-                # If no channel selected yet, try single-channel swap
-                # that minimizes loss (even if gain is tiny)
-                if not edited_channels:
-                    best_channel = None
-                    best_prob = current_prob
-                    best_loss = self._compute_loss(current_prob, 0)
-                    for channel in remaining_channels:
-                        candidate = cf.copy()
-                        candidate[channel, :] = distractor[channel, :]
-                        candidate_prob = float(
-                            self.predict_proba(candidate[None, ...])[0][target_class]
-                        )
-                        candidate_loss = self._compute_loss(candidate_prob, 1)
-                        if candidate_loss < best_loss:
-                            best_loss = candidate_loss
-                            best_prob = candidate_prob
-                            best_channel = channel
-                    if best_channel is not None:
-                        cf[best_channel, :] = distractor[best_channel, :]
-                        edited_channels.append(best_channel)
-                        remaining_channels.remove(best_channel)
-                        current_prob = best_prob
-                        continue
-                break
+        This fallback is only used when no channels have been edited yet, to
+        ensure at least one swap is attempted.
 
-            # Commit the best channel swap
-            cf[best_channel, :] = distractor[best_channel, :]
-            edited_channels.append(best_channel)
-            remaining_channels.remove(best_channel)
-            current_prob = best_prob
+        Parameters
+        ----------
+        cf : np.ndarray
+            Current counterfactual of shape ``(C, T)``.
+        distractor : np.ndarray
+            Distractor series of shape ``(C, T)``.
+        target_idx : int
+            Target class index.
+        remaining : set of int
+            Channel indices still available.
+        current_prob : float
+            Current target class probability.
 
-        return cf, edited_channels, current_prob
+        Returns
+        -------
+        tuple or None
+            ``(channel, prob)`` if a loss-improving swap exists, else ``None``.
+        """
+        best_loss = self._compute_loss(current_prob, 0)
+        best_channel = None
+        best_prob = current_prob
+
+        for ch in remaining:
+            candidate = cf.copy()
+            candidate[ch, :] = distractor[ch, :]
+            prob = self._predict_target_prob(candidate, target_idx)
+            loss = self._compute_loss(prob, 1)
+            if loss < best_loss:
+                best_loss = loss
+                best_prob = prob
+                best_channel = ch
+
+        if best_channel is not None:
+            return best_channel, best_prob
+        return None
+
+    def _predict_target_prob(self, arr: np.ndarray, target_idx: int) -> float:
+        """Return the model's probability for target_idx.
+
+        Parameters
+        ----------
+        arr : np.ndarray
+            Time series of shape ``(T,)`` or ``(C, T)``.
+        target_idx : int
+            Probability column index of the target class.
+
+        Returns
+        -------
+        float
+            Predicted probability for the target class.
+        """
+        return float(self.predict_proba(arr[None, ...])[0][target_idx])
+
+    def _predict_class_idx(self, arr: np.ndarray) -> int:
+        """Return the predicted class index for a single instance.
+
+        Parameters
+        ----------
+        arr : np.ndarray
+            Time series of shape ``(T,)`` or ``(C, T)``.
+
+        Returns
+        -------
+        int
+            Argmax index of the model's probability vector.
+        """
+        return int(np.argmax(self.predict_proba(arr[None, ...])[0]))
+
+    def _resolve_target_class(
+        self,
+        base_probs: np.ndarray,
+        base_idx: int,
+        class_of_interest: int | None,
+    ) -> int:
+        """Determine the target class index for counterfactual generation.
+
+        If ``class_of_interest`` is provided, it is converted to an internal
+        index. Otherwise, the highest-probability class other than
+        ``base_idx`` is selected.
+
+        Parameters
+        ----------
+        base_probs : np.ndarray
+            Probability vector for the query instance.
+        base_idx : int
+            Probability column index of the base (original) class.
+        class_of_interest : int or None
+            User-specified target class label, or ``None`` for automatic
+            selection.
+
+        Returns
+        -------
+        int
+            Probability column index for the target class.
+        """
+        if class_of_interest is not None:
+            return self._label_to_idx(class_of_interest)
+        probs_sorted = np.argsort(-base_probs)
+        return int(next(c for c in probs_sorted if c != base_idx))
 
     def _compute_loss(self, target_prob: float, n_edits: int) -> float:
         """Compute the counterfactual loss balancing validity and sparsity.
-
-        The loss combines two terms:
-        1. Validity penalty: penalizes low target class probability
-        2. Sparsity penalty: penalizes using more than delta variable edits
 
         Loss = max(0, tau - target_prob)^2 + lambda_reg * max(0, n_edits - delta)
 
@@ -587,3 +714,126 @@ class COMTE(Counterfactual):
         validity_penalty = max(0.0, self.tau - target_prob) ** 2
         sparsity_penalty = float(self.lambda_reg) * max(0, n_edits - int(self.delta))
         return float(validity_penalty + sparsity_penalty)
+
+    def _no_distractor_fallback(
+        self, x: np.ndarray, base_idx: int, target_idx: int
+    ) -> tuple[np.ndarray, int, dict[str, Any]]:
+        """Return the original instance unchanged when no distractors exist.
+
+        Emits a warning and returns a metadata dict with
+        ``validity=False`` and ``failure_reason='no_distractors'``.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Original time series of shape ``(T,)`` or ``(C, T)``.
+        base_idx : int
+            Probability column index of the base class.
+        target_idx : int
+            Probability column index of the target class.
+
+        Returns
+        -------
+        cf : np.ndarray
+            The original ``x`` (unchanged).
+        cf_label : int
+            Base class label.
+        meta : dict
+            Metadata dictionary flagged as invalid.
+
+        Warns
+        -----
+        UserWarning
+            When no distractors are found for the target class.
+        """
+        warnings.warn(
+            f"COMTE: No distractors found for target class "
+            f"{self._idx_to_label(target_idx)}. "
+            f"This typically occurs when the classifier predicts all reference "
+            f"samples as the same class (base class="
+            f"{self._idx_to_label(base_idx)}). The original "
+            f"instance is returned unchanged. Consider using a different dataset "
+            f"or a classifier with more diverse predictions.",
+            UserWarning,
+            stacklevel=3,
+        )
+        return (
+            x,
+            self._idx_to_label(base_idx),
+            {
+                "method": "comte_greedy",
+                "distance": self.distance,
+                "class_of_interest": self._idx_to_label(target_idx),
+                "validity": False,
+                "failure_reason": "no_distractors",
+                "note": "no distractors found; returning original unchanged",
+                "tau": self.tau,
+                "delta": self.delta,
+                "lambda": self.lambda_reg,
+            },
+        )
+
+    def _build_meta(
+        self,
+        target_idx: int,
+        distractor_meta: dict[str, Any],
+        distractor_i: int,
+        edits: list[int],
+        target_prob: float,
+        loss: float,
+        *,
+        k_index: int | None = None,
+    ) -> dict[str, Any]:
+        """Build the metadata dictionary for an explanation result.
+
+        Parameters
+        ----------
+        target_idx : int
+            Probability column index of the target class.
+        distractor_meta : dict
+            Metadata from distractor selection, containing ``'indices'``
+            and ``'distances'``.
+        distractor_i : int
+            Index into ``distractor_meta`` lists identifying the selected
+            distractor.
+        edits : list of int
+            Channel indices swapped, in order.
+        target_prob : float
+            Final probability of the target class.
+        loss : float
+            Computed loss for this counterfactual.
+        k_index : int or None
+            Index of this result within an ``explain_k`` batch. Omitted
+            from the dict when ``None``.
+
+        Returns
+        -------
+        dict
+            Metadata dictionary with keys ``method``, ``distance``,
+            ``class_of_interest``, ``tau``, ``delta``, ``lambda``,
+            ``lambda_reg``, ``distractor_index_in_ref``,
+            ``distractor_distance``, ``edits_variables``,
+            ``target_prob``, and ``loss`` (plus ``k_index`` when
+            applicable).
+        """
+        meta: dict[str, Any] = {
+            "method": "comte_greedy",
+            "distance": self.distance,
+            "class_of_interest": self._idx_to_label(target_idx),
+            "tau": float(self.tau),
+            "delta": int(self.delta),
+            "lambda": float(self.lambda_reg),
+            "lambda_reg": float(self.lambda_reg),
+            "distractor_index_in_ref": (
+                distractor_meta["indices"][distractor_i] if distractor_meta["indices"] else None
+            ),
+            "distractor_distance": (
+                distractor_meta["distances"][distractor_i] if distractor_meta["distances"] else None
+            ),
+            "edits_variables": edits,
+            "target_prob": float(target_prob),
+            "loss": float(loss),
+        }
+        if k_index is not None:
+            meta["k_index"] = k_index
+        return meta

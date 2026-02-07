@@ -81,10 +81,12 @@ import numpy as np
 from .base import Counterfactual
 from .utils import (
     ensure_batch_shape,
+    has_expensive_transform,
     soft_predict_proba_fn,
     strip_batch,
     supports_soft_probabilities,
 )
+from .utils._adam import AdamState
 
 WeightStrategy = Literal["uniform", "local", "global"]
 
@@ -114,7 +116,7 @@ class LatentCF(Counterfactual):
     model : object
         A classifier with a probability estimator (``predict_proba`` or a
         compatible interface).
-    data : tuple (X_ref, y_ref)
+    data : tuple (``X_ref``, ``y_ref``)
         Reference dataset used for computing feature importance (for 'global'
         weight strategy) and normalization statistics.
     probability : float, default 0.5
@@ -190,6 +192,11 @@ class LatentCF(Counterfactual):
     _global_weights: np.ndarray | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
+        """Initialise probability wrapper, RNG, reference data, and label mapping.
+
+        Validates all hyperparameters. Warns if the model is unlikely to
+        work well with gradient-based optimisation.
+        """
         # Warn about classifiers that may not work well with gradient optimization
         if not supports_soft_probabilities(self.model):
             warnings.warn(
@@ -205,6 +212,8 @@ class LatentCF(Counterfactual):
         self.rng = np.random.default_rng(self.random_state)
         self.X_ref = np.asarray(self.data[0])
         self.y_ref = np.asarray(self.data[1]).ravel()
+
+        self._init_label_mapping(self.model, self.y_ref)
 
         # Validate parameters
         if not (0.0 < self.probability <= 1.0):
@@ -265,37 +274,35 @@ class LatentCF(Counterfactual):
         xb, added = ensure_batch_shape(x)
         x1 = strip_batch(xb, added)
 
-        # Determine base prediction and target class
+        # Determine base prediction and target class (all in index space)
         base_probs = self.predict_proba(xb)[0]
-        base_label = int(np.argmax(base_probs)) if y_pred is None else int(y_pred)
+        base_idx = int(np.argmax(base_probs)) if y_pred is None else self._label_to_idx(y_pred)
 
-        if class_of_interest is None:
+        if class_of_interest is not None:
+            target_idx = self._label_to_idx(class_of_interest)
+        else:
             probs_sorted = np.argsort(-base_probs)
-            class_of_interest = int(next(c for c in probs_sorted if c != base_label))
+            target_idx = int(next(c for c in probs_sorted if c != base_idx))
 
         # Compute importance weights
-        weights = self._compute_weights(x1, base_label)
+        weights = self._compute_weights(x1, base_idx)
 
         # Run gradient-based optimization
         cf, n_iter, converged, final_prob, final_loss = self._optimize(
-            x1, base_label, class_of_interest, weights
+            x1, base_idx, target_idx, weights
         )
 
         # Get final prediction using soft probabilities (for consistency with optimization)
         cf_probs = self.predict_proba(cf[None, ...])[0]
-        cf_label_idx = int(np.argmax(cf_probs))
+        cf_idx = int(np.argmax(cf_probs))
 
         # Also get model's actual prediction for metadata
         model_cf_pred = self.model.predict(cf[None, ...])[0]
 
-        # Return label as the probability index (consistent with base_label)
-        # The caller can map to actual class if needed using model.classes_
-        cf_label = cf_label_idx
-
         meta: dict[str, Any] = {
             "method": "latent_cf",
             "step_weights": self.step_weights,
-            "class_of_interest": class_of_interest,
+            "class_of_interest": self._idx_to_label(target_idx),
             "pred_margin_weight": float(self.pred_margin_weight),
             "learning_rate": float(self.learning_rate),
             "probability_threshold": float(self.probability),
@@ -303,11 +310,11 @@ class LatentCF(Counterfactual):
             "converged": converged,
             "final_target_prob": float(final_prob),
             "final_loss": float(final_loss),
-            "validity": cf_label_idx != base_label,
+            "validity": cf_idx != base_idx,
             "model_cf_prediction": model_cf_pred,
         }
 
-        return cf, cf_label, meta
+        return cf, self._idx_to_label(cf_idx), meta
 
     def _compute_weights(self, x: np.ndarray, base_label: int) -> np.ndarray:
         """Compute importance weights for proximity loss.
@@ -536,10 +543,7 @@ class LatentCF(Counterfactual):
         data_scale = float(np.std(self.X_ref))
         effective_lr = self.learning_rate * data_scale
 
-        # Adam optimizer state
-        m = np.zeros_like(cf)  # First moment
-        v = np.zeros_like(cf)  # Second moment
-        beta1, beta2, adam_eps = 0.9, 0.999, 1e-8
+        adam = AdamState.zeros_like(cf)
 
         for iteration in range(self.max_iter):
             n_iterations = iteration + 1
@@ -570,11 +574,7 @@ class LatentCF(Counterfactual):
             gradient = self._compute_gradient(cf, x_original, target_class, step_weights, w)
 
             # Adam update
-            m = beta1 * m + (1 - beta1) * gradient
-            v = beta2 * v + (1 - beta2) * gradient**2
-            m_hat = m / (1 - beta1**n_iterations)
-            v_hat = v / (1 - beta2**n_iterations)
-            cf = cf - effective_lr * m_hat / (np.sqrt(v_hat) + adam_eps)
+            cf = cf - adam.step(gradient, effective_lr)
 
         return cf, n_iterations, converged, final_prob, final_loss
 
@@ -618,9 +618,15 @@ class LatentCF(Counterfactual):
         flat_cf = cf.flatten()
         n_features = len(flat_cf)
 
-        # Use all features for short series; subsample only for very long ones
+        # Subsample features for stochastic gradient estimation.
+        # For classifiers with expensive transforms (ROCKET, RDST), skip the
+        # n_features // 2 floor so the user's gradient_subsample is respected,
+        # reducing the number of costly transform calls per iteration.
         if self.gradient_subsample is not None and self.gradient_subsample < n_features:
-            n_sample = max(self.gradient_subsample, n_features // 2)
+            if has_expensive_transform(self.model):
+                n_sample = self.gradient_subsample
+            else:
+                n_sample = max(self.gradient_subsample, n_features // 2)
             n_sample = min(n_sample, n_features)
             sampled_idx = self.rng.choice(n_features, size=n_sample, replace=False)
         else:

@@ -61,7 +61,78 @@ class Counterfactual(ABC):
     instance (not batches) and returns the generated counterfactual, its
     predicted label, and an optional metadata dictionary describing how the
     counterfactual was produced.
+
+    Label Mapping
+    -------------
+    Subclasses that accept a ``model`` and ``data`` should call
+    :meth:`_init_label_mapping` during initialisation (e.g. in
+    ``__post_init__``).  This populates ``_classes`` and enables
+    :meth:`_idx_to_label` / :meth:`_label_to_idx` for converting between
+    probability-column indices and actual class labels.
     """
+
+    # Populated by _init_label_mapping; declared here so type checkers
+    # and IDE autocompletion see them on the base class.
+    _classes: np.ndarray
+    _label_to_idx_map: dict[Any, int]
+
+    def _init_label_mapping(self, model: Any, y_ref: np.ndarray) -> None:
+        """Build the label-to-index and index-to-label mapping.
+
+        Must be called once during subclass initialisation.
+
+        Parameters
+        ----------
+        model
+            Trained classifier.  If it exposes ``classes_`` the mapping
+            is derived from that attribute (guaranteeing agreement with
+            the column order of ``predict_proba``).  Otherwise
+            ``np.unique(y_ref)`` is used as a fallback.
+        y_ref : np.ndarray
+            Ground-truth labels from the reference dataset.
+        """
+        if hasattr(model, "classes_"):
+            self._classes = np.asarray(model.classes_)
+        else:
+            self._classes = np.unique(y_ref)
+        self._label_to_idx_map = {lbl: i for i, lbl in enumerate(self._classes)}
+
+    def _idx_to_label(self, class_idx: int) -> Any:
+        """Convert a probability column index to the actual class label.
+
+        Parameters
+        ----------
+        class_idx : int
+            Zero-based index into the probability output columns.
+
+        Returns
+        -------
+        Any
+            Corresponding class label from ``_classes``.
+        """
+        return self._classes[class_idx]
+
+    def _label_to_idx(self, label: Any) -> int:
+        """Convert an actual class label to a probability column index.
+
+        Parameters
+        ----------
+        label : Any
+            Class label to look up. String/int coercion is attempted if
+            the exact value is not found.
+
+        Returns
+        -------
+        int
+            Zero-based index into the probability output columns.
+        """
+        if label in self._label_to_idx_map:
+            return self._label_to_idx_map[label]
+        # Label might be int while classes are str, or vice versa
+        str_label = str(label)
+        if str_label in self._label_to_idx_map:
+            return self._label_to_idx_map[str_label]
+        raise ValueError(f"Label {label!r} not found in classes {self._classes}")
 
     @abstractmethod
     def explain(

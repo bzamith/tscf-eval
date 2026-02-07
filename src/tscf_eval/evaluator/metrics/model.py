@@ -124,6 +124,18 @@ class Controllability(Metric):
         n_samples: int = 10,
         random_state: int | None = None,
     ):
+        """Initialize the Controllability metric.
+
+        Parameters
+        ----------
+        revert_fractions : list of float, optional
+            Fractions of changed features to revert at each probe level.
+            Default is ``[0.1, 0.2, 0.3, 0.4, 0.5]``.
+        n_samples : int, default 10
+            Number of random subsets to draw per fraction per instance.
+        random_state : int or None, default None
+            Seed for reproducibility.
+        """
         self.revert_fractions = revert_fractions or [0.1, 0.2, 0.3, 0.4, 0.5]
         self.n_samples = n_samples
         self.random_state = random_state

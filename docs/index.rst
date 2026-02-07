@@ -11,11 +11,11 @@ a unified, extensible toolkit.
 
 Given a time series classifier and counterfactual explanations, TSCFEval provides:
 
-- **10 evaluation metrics** organized into **six quality dimensions** (core quality, distribution alignment, structural properties, model behavior, stability, and computational performance)
+- **11 evaluation metrics** organized into **six quality dimensions** (core quality, distribution alignment, structural properties, model behavior, stability, and computational performance)
 - **Weighted scalarization** for aggregating metrics into composite scores, enabling customizable method ranking
 - **Confidence-stratified instance selection** for benchmarking across the decision boundary
 - **Three benchmarking scenarios**: single dataset with multiple CF methods, single dataset with multiple classifiers, and multiple datasets with a fixed classifier
-- **5 built-in CF methods** for generating counterfactuals
+- **7 built-in CF methods** for generating counterfactuals
 - **Pareto and Friedman analysis** for principled multi-criteria comparison
 
 Installation
@@ -46,6 +46,10 @@ Counterfactual Methods
      - Strategy
      - Description
      - Reference
+   * - ``CELS``
+     - Saliency map
+     - Learned saliency map blending with nearest unlike neighbor
+     - Li et al., 2023
    * - ``NativeGuide``
      - Instance-based
      - Nearest unlike neighbor guidance (blend, ng, dtw_dba, cam)
@@ -54,6 +58,10 @@ Counterfactual Methods
      - Instance-based
      - Greedy channel substitution for multivariate TS
      - Ates et al., 2021
+   * - ``SETS``
+     - Shapelet-based
+     - Class-specific shapelet manipulation with contiguous perturbations
+     - Bahri et al., 2022
    * - ``TSEvo``
      - Evolutionary
      - Multi-objective optimization via NSGA-II
@@ -70,7 +78,7 @@ Counterfactual Methods
 Evaluation Metrics
 ~~~~~~~~~~~~~~~~~~
 
-TSCFEval implements 10 metrics organized into six quality dimensions:
+TSCFEval implements 11 metrics organized into six quality dimensions:
 
 .. list-table::
    :header-rows: 1
@@ -82,11 +90,11 @@ TSCFEval implements 10 metrics organized into six quality dimensions:
      - Direction
    * - Core Quality
      - ``Validity``
-     - Fraction of CFs that flip the prediction
+     - Fraction of CFs that flip the prediction (hard or soft mode)
      - maximize
    * - Core Quality
      - ``Proximity``
-     - Closeness to original instance (L1, L2, L-inf)
+     - Closeness to original instance (L1, L2, L-inf, DTW)
      - maximize
    * - Core Quality
      - ``Sparsity``
@@ -94,11 +102,11 @@ TSCFEval implements 10 metrics organized into six quality dimensions:
      - minimize
    * - Distribution
      - ``Plausibility``
-     - Whether CFs lie within data distribution (LOF, IF, MP-OCSVM)
+     - Whether CFs lie within data distribution (LOF, IF, MP-OCSVM, DTW-LOF)
      - maximize
    * - Distribution
      - ``Diversity``
-     - Variety among multiple CFs (DPP-based)
+     - Variety among multiple CFs via DPP (Euclidean or DTW)
      - maximize
    * - Structure
      - ``Contiguity``
@@ -112,9 +120,13 @@ TSCFEval implements 10 metrics organized into six quality dimensions:
      - ``Confidence``
      - Model confidence on original and CF predictions
      - maximize
+   * - Model Behavior
+     - ``Controllability``
+     - Ease of reverting CF changes via single-feature edits
+     - maximize
    * - Stability
      - ``Robustness``
-     - Local Lipschitz-like stability to input perturbations
+     - Local Lipschitz-like stability to input perturbations (Euclidean or DTW)
      - minimize
    * - Performance
      - ``Efficiency``

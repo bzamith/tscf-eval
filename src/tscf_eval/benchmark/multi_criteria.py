@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, NamedTuple
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -43,6 +44,8 @@ from tscf_eval.evaluator.metrics import (
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
+
+    from tscf_eval.evaluator.base import Metric
 
     from .results import BenchmarkResults
 
@@ -65,7 +68,14 @@ def _build_direction_registry() -> dict[str, bool]:
     """
     registry: dict[str, bool] = {}
 
-    def _register(metric_instance) -> None:
+    def _register(metric_instance: Metric) -> None:
+        """Register a metric instance in the direction registry.
+
+        Parameters
+        ----------
+        metric_instance : Metric
+            Metric whose name and direction to record.
+        """
         is_max = metric_instance.direction == "maximize"
         registry[metric_instance.name()] = is_max
 
@@ -73,12 +83,17 @@ def _build_direction_registry() -> dict[str, bool]:
     for cls in (Validity, Sparsity, Diversity, Contiguity, Controllability, Robustness, Efficiency):
         _register(cls())
 
-    # Parameterized: Proximity (common norms)
+    # Parameterized: Validity (both modes)
+    _register(Validity(mode="hard"))
+    _register(Validity(mode="soft"))
+
+    # Parameterized: Proximity (common norms + DTW)
     for p in (1, 2, float("inf")):
-        _register(Proximity(p=p))
+        _register(Proximity(p=p, distance="lp"))
+    _register(Proximity(distance="dtw"))
 
     # Parameterized: Plausibility (common methods)
-    for method in ("lof", "if"):
+    for method in ("lof", "if", "dtw_lof"):
         _register(Plausibility(method=method))
 
     # Dict-returning metrics: register their flattened sub-keys
@@ -104,7 +119,18 @@ _DIRECTION_REGISTRY: dict[str, bool] = _build_direction_registry()
 
 
 def _is_maximize(metric: str) -> bool:
-    """Check whether higher values are better for *metric*."""
+    """Check whether higher values are better for a given metric.
+
+    Parameters
+    ----------
+    metric : str
+        Metric name to look up.
+
+    Returns
+    -------
+    bool
+        ``True`` if the metric should be maximized, ``False`` otherwise.
+    """
     if metric in _DIRECTION_REGISTRY:
         return _DIRECTION_REGISTRY[metric]
 
@@ -273,6 +299,18 @@ def format_latex_table(
                 best_idx[col] = int(df[col].idxmin())
 
     def _header(col: str) -> str:
+        """Format a column name as a LaTeX header with optional arrow.
+
+        Parameters
+        ----------
+        col : str
+            Column name to format.
+
+        Returns
+        -------
+        str
+            Formatted header string.
+        """
         h = col
         if escape_underscores:
             h = h.replace("_", "\\_")
@@ -350,11 +388,23 @@ class ParetoAnalyzer:
     directions: dict[str, Literal["min", "max"]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        """Validate that at least one metric is provided."""
         if not self.metrics:
             raise ValueError("At least one metric is required.")
 
     def _get_direction(self, metric: str) -> bool:
-        """Get direction for a metric.  Returns ``True`` if maximize."""
+        """Get the optimization direction for a metric.
+
+        Parameters
+        ----------
+        metric : str
+            Metric name to look up.
+
+        Returns
+        -------
+        bool
+            ``True`` if the metric should be maximized.
+        """
         if metric in self.directions:
             return self.directions[metric] == "max"
         return _is_maximize(metric)
@@ -407,7 +457,21 @@ class ParetoAnalyzer:
         return names, values
 
     def _dominates(self, a: np.ndarray, b: np.ndarray) -> bool:
-        """Check if solution *a* dominates solution *b* (lower is better)."""
+        """Check if solution *a* Pareto-dominates solution *b* (lower is better).
+
+        Parameters
+        ----------
+        a : np.ndarray
+            Objective values for solution a, shape ``(n_metrics,)``.
+        b : np.ndarray
+            Objective values for solution b, shape ``(n_metrics,)``.
+
+        Returns
+        -------
+        bool
+            ``True`` if ``a`` is at least as good in all objectives and
+            strictly better in at least one.
+        """
         at_least_as_good = np.all(a <= b)
         strictly_better = np.any(a < b)
         return bool(at_least_as_good and strictly_better)
@@ -570,6 +634,19 @@ class ParetoAnalyzer:
         """Get DataFrame with metric values and Pareto status.
 
         Alias for :meth:`dominance_ranking`.
+
+        Parameters
+        ----------
+        results : BenchmarkResults
+            Benchmark results to analyze.
+        aggregate_by : str, default "explainer"
+            Dimension to aggregate by.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with columns ``name``, ``dominated_by``,
+            ``dominates``, ``pareto``, plus one column per metric.
         """
         return self.dominance_ranking(results, aggregate_by)
 
@@ -695,6 +772,13 @@ class ParetoAnalyzer:
                 ]
                 adjust_text(texts, ax=ax)
             except ImportError:
+                warnings.warn(
+                    "adjustText is not installed. Label placement in the Pareto "
+                    "plot may overlap. Install adjustText for improved annotation: "
+                    "pip install adjustText",
+                    UserWarning,
+                    stacklevel=2,
+                )
                 for name, xv, yv in zip(all_names, all_xs, all_ys, strict=True):
                     ax.annotate(
                         name,
@@ -893,6 +977,7 @@ class WeightedScalarizer:
     directions: dict[str, Literal["min", "max"]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        """Validate metrics and normalize weights to sum to 1."""
         if not self.metrics:
             raise ValueError("At least one metric is required.")
         if not self.weights:
@@ -905,7 +990,18 @@ class WeightedScalarizer:
             self.weights = {m: self.weights.get(m, 0.0) / total for m in self.metrics}
 
     def _get_direction(self, metric: str) -> bool:
-        """Get direction for a metric.  Returns ``True`` if maximize."""
+        """Get the optimization direction for a metric.
+
+        Parameters
+        ----------
+        metric : str
+            Metric name to look up.
+
+        Returns
+        -------
+        bool
+            ``True`` if the metric should be maximized.
+        """
         if metric in self.directions:
             return self.directions[metric] == "max"
         return _is_maximize(metric)

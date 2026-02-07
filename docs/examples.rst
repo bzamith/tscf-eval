@@ -16,7 +16,8 @@ evaluate it using tscf-eval's metrics, follow these examples.
 Basic Evaluation with Labels
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The simplest case is when you have pre-computed counterfactuals and their labels:
+The simplest case is when you have pre-computed counterfactuals and their labels.
+Metrics like Plausibility and Diversity require ``X_train``.
 
 .. code-block:: python
 
@@ -37,7 +38,7 @@ The simplest case is when you have pre-computed counterfactuals and their labels
    # Create evaluator with desired metrics
    evaluator = Evaluator([
        Validity(),
-       Proximity(p=2),
+      Proximity(p=2, distance="lp"),
        Sparsity(),
        Plausibility(method="lof"),
        Contiguity(),
@@ -78,7 +79,7 @@ provide a fitted classifier:
    # Create evaluator with model-dependent metrics
    evaluator = Evaluator([
        Validity(),
-       Proximity(p=2),
+      Proximity(p=2, distance="lp"),
        Sparsity(),
        Controllability(),
        Confidence(),
@@ -121,7 +122,7 @@ If you tracked generation time per instance, include it for the Efficiency metri
    # Evaluator with Efficiency metric
    evaluator = Evaluator([
        Validity(),
-       Proximity(p=2),
+      Proximity(p=2, distance="lp"),
        Efficiency(),
    ])
 
@@ -134,10 +135,10 @@ If you tracked generation time per instance, include it for the Efficiency metri
 
    print(f"Mean time per instance: {results['efficiency_time_s']:.4f}s")
 
-Using All Available Metrics
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Full Evaluation (All Metric Classes)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-For full evaluation, use all 10 metrics:
+For full evaluation, use all metric classes:
 
 .. code-block:: python
 
@@ -151,9 +152,9 @@ For full evaluation, use all 10 metrics:
    evaluator = Evaluator([
        # Core metrics
        Validity(),
-       Proximity(p=1),         # L1 distance
-       Proximity(p=2),         # L2 distance
-       Proximity(p=float("inf")),  # L-infinity distance
+      Proximity(p=1, distance="lp"),         # L1 distance
+      Proximity(p=2, distance="lp"),         # L2 distance
+      Proximity(p=float("inf"), distance="lp"),  # L-infinity distance
        Sparsity(),
 
        # Distribution metrics

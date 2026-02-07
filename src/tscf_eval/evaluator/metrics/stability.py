@@ -15,8 +15,12 @@ Robustness
 
 from __future__ import annotations
 
+from typing import Literal
+
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
+
+from tscf_eval.counterfactuals.utils._distance import dtw_distance_vec_multich
 
 from ..base import Metric
 from ._utils import ensure_array
@@ -28,10 +32,9 @@ class Robustness(Metric):
     This metric estimates how sensitive counterfactuals are relative to
     the original inputs by scanning local neighbor pairs. For each instance
     i and its k nearest neighbors j (excluding i) it computes the ratio
-    ``||x_cf[i] - x_cf[j]|| / ||x[i] - x[j]||`` (Euclidean norm after
-    flattening the per-instance arrays). Larger values indicate that small
-    perturbations in the original space can produce larger changes in the
-    counterfactual space, i.e., lower local robustness.
+    ``d(x_cf[i], x_cf[j]) / d(x[i], x[j])``. Larger values indicate that
+    small perturbations in the original space can produce larger changes in
+    the counterfactual space, i.e., lower local robustness.
 
     Parameters
     ----------
@@ -39,14 +42,34 @@ class Robustness(Metric):
         Number of neighbors to consider. Default is 5. If the dataset has
         fewer instances than ``k + 1``, the number of neighbors is reduced
         accordingly.
+    distance : {"euclidean", "dtw"}, default "dtw"
+        Distance function to use.
+
+        - ``"euclidean"``: Euclidean distance on flattened vectors.
+        - ``"dtw"``: Per-channel DTW distance (averaged across channels).
+          Requires ``tslearn``; falls back to Euclidean if unavailable.
 
     See Ates et al. (2021) for details.
     """
 
     direction = "minimize"  # Lower Lipschitz ratio means more stable/robust
 
-    def __init__(self, k: int = 5):
+    def __init__(self, k: int = 5, distance: Literal["euclidean", "dtw"] = "dtw"):
+        """Initialize the Robustness metric.
+
+        Parameters
+        ----------
+        k : int, default 5
+            Number of nearest neighbors to consider.
+        distance : {"euclidean", "dtw"}, default "dtw"
+            Distance function to use.
+        """
+        if k < 1:
+            raise ValueError("k must be >= 1")
+        if distance not in ("euclidean", "dtw"):
+            raise ValueError("distance must be one of {'euclidean', 'dtw'}")
         self.k = int(k)
+        self.distance = distance
 
     def name(self) -> str:
         """Return the metric name.
@@ -54,8 +77,11 @@ class Robustness(Metric):
         Returns
         -------
         str
-            ``'robustness_lipschitz'``.
+            ``'robustness_lipschitz'`` for Euclidean distance or
+            ``'robustness_lipschitz_dtw'`` for DTW distance.
         """
+        if self.distance == "dtw":
+            return "robustness_lipschitz_dtw"
         return "robustness_lipschitz"
 
     def compute(
@@ -90,40 +116,104 @@ class Robustness(Metric):
         if M <= 1:
             return 0.0
 
+        if self.distance == "dtw":
+            return self._compute_dtw(X, X_cf, M)
+        if self.distance == "euclidean":
+            return self._compute_euclidean(X, X_cf, M)
+        raise ValueError(f"Unknown distance: {self.distance!r}. Expected 'euclidean' or 'dtw'.")
+
+    def _compute_euclidean(self, X: np.ndarray, X_cf: np.ndarray, M: int) -> float:
+        """Compute robustness using Euclidean distance.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Original instances, shape ``(M, ...)``.
+        X_cf : np.ndarray
+            Counterfactual instances, same shape as ``X``.
+        M : int
+            Number of instances.
+
+        Returns
+        -------
+        float
+            95th-percentile neighbor ratio (>= 0).
+        """
         n_neighbors = min(self.k + 1, M)
-        nbrs = NearestNeighbors(n_neighbors=n_neighbors).fit(X)
-        _, indices = nbrs.kneighbors(X)
+        X_flat = X.reshape(M, -1)
+        X_cf_flat = X_cf.reshape(M, -1)
 
-        # Vectorized computation of neighbor ratios
+        nbrs = NearestNeighbors(n_neighbors=n_neighbors).fit(X_flat)
+        _, indices = nbrs.kneighbors(X_flat)
+
         eps = 1e-12
-
-        # Flatten instances for norm computation
-        X_flat = X.reshape(M, -1)  # (M, D)
-        X_cf_flat = X_cf.reshape(M, -1)  # (M, D)
-
-        # neigh_idx has shape (M, k) where k = n_neighbors - 1 (excluding self)
         neigh_idx = indices[:, 1:]  # (M, k)
 
-        # Gather neighbor arrays using fancy indexing
-        # X_flat[neigh_idx] has shape (M, k, D)
         X_neigh = X_flat[neigh_idx]  # (M, k, D)
         X_cf_neigh = X_cf_flat[neigh_idx]  # (M, k, D)
 
-        # Compute differences: each instance vs its neighbors
-        # X_flat[:, None, :] has shape (M, 1, D), broadcasting to (M, k_actual, D)
-        diff_orig = X_flat[:, None, :] - X_neigh  # (M, k_actual, D)
-        diff_cf = X_cf_flat[:, None, :] - X_cf_neigh  # (M, k_actual, D)
+        diff_orig = X_flat[:, None, :] - X_neigh
+        diff_cf = X_cf_flat[:, None, :] - X_cf_neigh
 
-        # Compute norms along the feature dimension
-        norms_orig = np.sqrt(np.sum(diff_orig**2, axis=2))  # (M, k_actual)
-        norms_cf = np.sqrt(np.sum(diff_cf**2, axis=2))  # (M, k_actual)
+        norms_orig = np.sqrt(np.sum(diff_orig**2, axis=2))
+        norms_cf = np.sqrt(np.sum(diff_cf**2, axis=2))
 
-        # Compute ratios with safe denominator
         norms_orig_safe = np.maximum(norms_orig, eps)
-        ratios = norms_cf / norms_orig_safe  # (M, k_actual)
+        ratios = norms_cf / norms_orig_safe
 
         if ratios.size == 0:
             return 0.0
-        # Use 95th percentile instead of max to reduce sensitivity to
-        # single outlier neighbor pairs.
+        return float(np.percentile(ratios, 95))
+
+    def _compute_dtw(self, X: np.ndarray, X_cf: np.ndarray, M: int) -> float:
+        """Compute robustness using DTW distance.
+
+        Builds precomputed pairwise DTW distance matrices for both X and
+        X_cf, finds k-nearest neighbors in DTW space, and computes the
+        Lipschitz-like ratio using DTW distances.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Original instances, shape ``(M, ...)``.
+        X_cf : np.ndarray
+            Counterfactual instances, same shape as ``X``.
+        M : int
+            Number of instances.
+
+        Returns
+        -------
+        float
+            95th-percentile neighbor ratio (>= 0).
+        """
+        # Build pairwise DTW distance matrix for X
+        D_X = np.zeros((M, M), dtype=float)
+        for i in range(M):
+            D_X[i] = dtw_distance_vec_multich(X[i], X)
+        D_X = 0.5 * (D_X + D_X.T)
+
+        # Build pairwise DTW distance matrix for X_cf
+        D_cf = np.zeros((M, M), dtype=float)
+        for i in range(M):
+            D_cf[i] = dtw_distance_vec_multich(X_cf[i], X_cf)
+        D_cf = 0.5 * (D_cf + D_cf.T)
+
+        # Find k-nearest neighbors using precomputed DTW distances on X
+        n_neighbors = min(self.k + 1, M)
+        nbrs = NearestNeighbors(n_neighbors=n_neighbors, metric="precomputed").fit(D_X)
+        _, indices = nbrs.kneighbors(D_X)
+
+        eps = 1e-12
+        neigh_idx = indices[:, 1:]  # (M, k)
+
+        # Gather pairwise distances for each instance and its neighbors
+        row_idx = np.arange(M)[:, None]  # (M, 1)
+        norms_orig = D_X[row_idx, neigh_idx]  # (M, k)
+        norms_cf = D_cf[row_idx, neigh_idx]  # (M, k)
+
+        norms_orig_safe = np.maximum(norms_orig, eps)
+        ratios = norms_cf / norms_orig_safe
+
+        if ratios.size == 0:
+            return 0.0
         return float(np.percentile(ratios, 95))

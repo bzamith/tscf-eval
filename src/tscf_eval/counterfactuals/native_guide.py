@@ -85,10 +85,12 @@ from .utils import (
 
 try:
     from tslearn.metrics import dtw as _tslearn_dtw  # noqa: F401
+    from tslearn.neighbors import KNeighborsTimeSeries
 
     TSLEARN_AVAILABLE = True
 except ImportError:  # pragma: no cover
     TSLEARN_AVAILABLE = False
+    KNeighborsTimeSeries = None  # type: ignore
 
 
 @dataclass
@@ -129,6 +131,11 @@ class NativeGuide(Counterfactual):
         - 'cam': Window replacement guided by CAM importance function.
     distance : {'euclidean', 'dtw'}, default 'dtw'
         Distance metric used to rank distractors when searching the reference set.
+
+        - ``'euclidean'``: Euclidean distance on flattened vectors. Faster but
+          ignores temporal alignment.
+        - ``'dtw'``: Dynamic Time Warping distance (per-channel, averaged).
+          Respects temporal shifts and is recommended for time series.
     k_unlike : int, default 5
         Number of unlike neighbors to consider when computing a DTW-DBA guide.
     random_state : int or None, default 0
@@ -139,12 +146,6 @@ class NativeGuide(Counterfactual):
     target_prob : float, default 0.5
         For ``method='blend'``: target probability threshold for the counterfactual
         class (original paper uses 0.5).
-    init_window_frac : float, default 0.1
-        For window-based methods: initial window size as a fraction of T.
-    step_frac : float, default 0.05
-        For window-based methods: fractional increment for window growth.
-    max_window_frac : float, default 1.0
-        For window-based methods: maximum allowed window size as a fraction of T.
     cam_importance_fn : callable or None
         When ``method=='cam'``, a function with signature
         ``(series, y_pred) -> np.ndarray`` that returns an importance map of
@@ -176,15 +177,24 @@ class NativeGuide(Counterfactual):
     beta_step: float = 0.01  # increment for blending weight
     target_prob: float = 0.5  # target probability threshold
 
-    # Window-growth hyperparameters (fractions of T)
-    init_window_frac: float = 0.1  # start with 10% of the length
-    step_frac: float = 0.05  # grow by +5% each attempt
-    max_window_frac: float = 1.0  # cap at 100%
-
     # Only used when method="cam": importance fn(series, y_pred) -> (T,) or (C,T)
     cam_importance_fn: Callable[[np.ndarray, int], np.ndarray] | None = None
 
     def __post_init__(self):
+        """Initialise probability wrapper, RNG, reference data, and label mapping.
+
+        Validates all hyperparameters, pre-computes reference-set
+        predictions, and checks method-specific requirements (e.g.
+        ``cam_importance_fn`` when ``method='cam'``).
+
+        Raises
+        ------
+        ValueError
+            If ``X`` and ``y`` have mismatched sample counts, ``method`` or
+            ``distance`` is not in the allowed set, ``beta_step`` or
+            ``target_prob`` is outside ``(0, 1]``, or ``method='cam'``
+            without a ``cam_importance_fn``.
+        """
         X_ref, y_ref = self.data
         self.X_ref = np.asarray(X_ref)
         self.y_ref = np.asarray(y_ref).ravel()
@@ -192,8 +202,12 @@ class NativeGuide(Counterfactual):
             raise ValueError("X and y must have the same number of samples.")
         self.predict_proba = soft_predict_proba_fn(self.model)
         self.rng = np.random.default_rng(self.random_state)
+
+        self._init_label_mapping(self.model, self.y_ref)
+
         # Pre-compute reference set predictions to avoid redundant calls
         self._ref_probs = self.predict_proba(self.X_ref)
+        # Store as probability column indices (consistent with internal index space)
         self._ref_yhat = np.argmax(self._ref_probs, axis=1)
 
         if self.method not in {"blend", "ng", "dtw_dba", "cam"}:
@@ -204,15 +218,6 @@ class NativeGuide(Counterfactual):
             self.k_unlike = 2
         if self.method == "cam" and self.cam_importance_fn is None:
             raise ValueError("cam_importance_fn must be provided when method='cam'.")
-
-        # sanity checks for window-based methods
-        for frac_name, frac in [
-            ("init_window_frac", self.init_window_frac),
-            ("step_frac", self.step_frac),
-            ("max_window_frac", self.max_window_frac),
-        ]:
-            if not (0.0 < frac <= 1.0):
-                raise ValueError(f"{frac_name} must be in (0, 1].")
 
         # sanity checks for blend method
         if not (0.0 < self.beta_step <= 1.0):
@@ -252,364 +257,37 @@ class NativeGuide(Counterfactual):
             - ``window_start``: Start of replacement window (else ``None``).
             - ``window_len``: Length of replacement window (else ``None``).
         """
-
         xb, added = ensure_batch_shape(x)
         x1 = strip_batch(xb, added)
 
-        base_label = int(np.argmax(self.predict_proba(xb)[0])) if y_pred is None else int(y_pred)
-
-        # 1) Build native guide (NUN or DTW-DBA over unlike neighbors)
-        guide, gmeta = self._build_native_guide(x1, base_label)
-
-        # 2) Generate counterfactual based on method
-        if self.method == "blend":
-            # Original paper: weighted DTW barycenter averaging
-            cf, cf_label, beta = self._blend_search(x1, guide, base_label)
-            meta = {
-                "method": self.method,
-                "distance": self.distance,
-                "nun_index_in_X": gmeta.get("nun_index_in_X"),
-                "neighbor_indices": gmeta.get("neighbor_indices"),
-                "neighbor_distance": gmeta.get("neighbor_distance"),
-                "beta": beta,
-                "window_start": None,
-                "window_len": None,
-            }
+        if y_pred is None:
+            base_idx = int(np.argmax(self.predict_proba(xb)[0]))
         else:
-            # Window-based methods: ng, dtw_dba, cam
-            imp = self._get_importance(x1, base_label)  # (T,) or None
-            start, L, cf, cf_label = self._window_growth_search(x1, guide, base_label, imp)
-            meta = {
-                "method": self.method,
-                "distance": self.distance,
-                "nun_index_in_X": gmeta.get("nun_index_in_X"),
-                "neighbor_indices": gmeta.get("neighbor_indices"),
-                "neighbor_distance": gmeta.get("neighbor_distance"),
-                "beta": None,
-                "window_start": start,
-                "window_len": L,
-            }
+            base_idx = self._label_to_idx(y_pred)
 
-        return cf, cf_label, meta
-
-    def _build_native_guide(
-        self, x: np.ndarray, base_label: int
-    ) -> tuple[np.ndarray, dict[str, Any]]:
-        """Retrieve the native guide used as the content source.
-
-        Parameters
-        ----------
-        x : np.ndarray
-            Query time series of shape ``(T,)`` or ``(C, T)``.
-        base_label : int
-            Original predicted class label to find unlike neighbors for.
-
-        Returns
-        -------
-        guide : np.ndarray
-            Native guide series with the same shape as ``x``.
-        metadata : dict
-            Dictionary containing ``'nun_index_in_X'``, ``'neighbor_indices'``,
-            and ``'neighbor_distance'``.
-        """
-        # Use pre-computed reference set predictions (computed once in __post_init__)
-        yhat = self._ref_yhat
-        unlike_mask = yhat != base_label
-        if not np.any(unlike_mask):
-            # No unlike neighbor available: fallback to global mean
-            warnings.warn(
-                f"NativeGuide: No unlike neighbors found in reference set. "
-                f"The classifier predicts all {len(yhat)} reference samples as class "
-                f"{base_label}. Falling back to global mean, which may not produce "
-                f"a valid counterfactual. Consider using a different dataset or "
-                f"classifier with more diverse predictions.",
-                UserWarning,
-                stacklevel=3,
-            )
-            guide = self._global_mean_like(self.X_ref)
-            return guide, {
-                "nun_index_in_X": None,
-                "neighbor_indices": None,
-                "neighbor_distance": float(np.nan),
-                "failure_reason": "no_unlike_neighbors",
-            }
-
-        X_unlike = self.X_ref[unlike_mask]
-        dvec = self._distance_vec(x, X_unlike)
-        order = np.argsort(dvec)
-        nun_in_unlike = int(order[0])
-
-        # Map indices back to the original reference indices and provide metadata
-        ref_indices = np.flatnonzero(unlike_mask)
-        nun_index_in_ref = int(ref_indices[nun_in_unlike])
-
+        # Step 1: Retrieve the native guide
         if self.method == "dtw_dba":
-            k = min(self.k_unlike, len(order))
-            nbr_idx_unlike = order[:k]
-            nbrs = X_unlike[nbr_idx_unlike]
-            guide = dba_barycenter_multich(nbrs)
-            neighbor_indices = ref_indices[nbr_idx_unlike].tolist()
-            neighbor_distance = float(dvec[nbr_idx_unlike[0]])
-            return guide, {
-                "nun_index_in_X": nun_index_in_ref,
-                "neighbor_indices": neighbor_indices,
-                "neighbor_distance": neighbor_distance,
-            }
-
-        # 'blend', 'ng' and 'cam' use the single nearest-unlike neighbor as the guide
-        nun = X_unlike[nun_in_unlike]
-        return nun, {
-            "nun_index_in_X": nun_index_in_ref,
-            "neighbor_indices": None,
-            "neighbor_distance": float(dvec[nun_in_unlike]),
-        }
-
-    def _blend_search(
-        self, x: np.ndarray, guide: np.ndarray, base_label: int
-    ) -> tuple[np.ndarray, int, float]:
-        """Original paper method: weighted DTW barycenter averaging.
-
-        Incrementally increases the guide's influence (beta) until the model's
-        predicted class flips or the target probability is reached.
-
-        Parameters
-        ----------
-        x : np.ndarray
-            Query series of shape (T,) or (C, T).
-        guide : np.ndarray
-            Native guide (NUN) of same shape as x.
-        base_label : int
-            Original predicted class label.
-
-        Returns
-        -------
-        cf : np.ndarray
-            Counterfactual series with the same shape as ``x``.
-        cf_label : int
-            Predicted class label for the counterfactual.
-        beta : float
-            Final blending weight in ``[0, 1]``.
-        """
-
-        def _predict(arr: np.ndarray) -> tuple[int, float]:
-            """Return (predicted_label, target_class_probability)."""
-            cb, _ = ensure_batch_shape(arr)
-            probs = self.predict_proba(cb)[0]
-            pred_label = int(np.argmax(probs))
-            # Target class is any class != base_label; use highest non-base prob
-            target_probs = [(i, p) for i, p in enumerate(probs) if i != base_label]
-            target_prob = max(p for _, p in target_probs) if target_probs else 0.0
-            return pred_label, target_prob
-
-        beta = 0.0
-        cf = x.copy()
-        cf_label, target_prob = _predict(cf)
-
-        # Iterate until target probability threshold or prediction flip
-        while target_prob < self.target_prob and beta < 1.0:
-            beta += self.beta_step
-            beta = min(beta, 1.0)  # cap at 1.0
-            cf = weighted_dba_multich(x, guide, beta)
-            cf_label, target_prob = _predict(cf)
-            if cf_label != base_label:
-                break
-
-        return cf, cf_label, beta
-
-    def _get_importance(self, x: np.ndarray, base_label: int) -> np.ndarray | None:
-        """Return a 1-D importance map used to pick the discriminative window.
-
-        If ``method=='cam'`` the provided CAM function is used. Otherwise
-        ``None`` is returned and a heuristic ``|guide - x|`` is used
-        on-demand inside window search.
-
-        Parameters
-        ----------
-        x : np.ndarray
-            Query time series of shape ``(T,)`` or ``(C, T)``.
-        base_label : int
-            Original predicted class label.
-
-        Returns
-        -------
-        np.ndarray or None
-            Importance map of shape ``(T,)`` if ``method='cam'``,
-            otherwise ``None``.
-        """
-        if self.method != "cam":
-            return None
-
-        # cam_importance_fn is guaranteed to be present when method == 'cam'
-        assert self.cam_importance_fn is not None
-        imp = np.asarray(self.cam_importance_fn(x, base_label))
-        # Normalize / validate shapes and reduce to (T,) when necessary
-        if x.ndim == 1:
-            if imp.ndim != 1 or imp.shape[0] != x.shape[0]:
-                raise ValueError("cam_importance_fn must return shape (T,) for univariate input.")
-            return imp
-
-        # multivariate input: prefer (C, T) or (T,)
-        if imp.ndim == 1:
-            if imp.shape[0] != x.shape[1]:
-                raise ValueError("When returning (T,), length must match time length.")
-            return imp
-        if imp.ndim == 2 and imp.shape == x.shape:
-            sum_result: np.ndarray = imp.sum(axis=0)
-            return sum_result
-        raise ValueError("cam_importance_fn must return (T,) or (C,T) for multivariate input.")
-
-    def _window_growth_search(
-        self,
-        x: np.ndarray,
-        guide: np.ndarray,
-        base_label: int,
-        imp: np.ndarray | None,
-    ) -> tuple[int, int, np.ndarray, int]:
-        """Grow a contiguous window and copy content from guide until flip.
-
-        Iteratively grows a contiguous window (positioned by importance) and
-        copies content from the guide until the model's prediction flips.
-
-        Parameters
-        ----------
-        x : np.ndarray
-            Query time series of shape ``(T,)`` or ``(C, T)``.
-        guide : np.ndarray
-            Native guide series with the same shape as ``x``.
-        base_label : int
-            Original predicted class label.
-        imp : np.ndarray or None
-            Importance map of shape ``(T,)``. If ``None``, uses
-            ``|guide - x|`` as a heuristic.
-
-        Returns
-        -------
-        start : int
-            Start index of the replacement window.
-        L : int
-            Length of the replacement window.
-        cf : np.ndarray
-            Counterfactual series with the same shape as ``x``.
-        cf_label : int
-            Predicted class label for the counterfactual.
-        """
-        T = x.shape[-1] if x.ndim == 2 else x.shape[0]
-        init_L = max(1, round(self.init_window_frac * T))
-        step = max(1, round(self.step_frac * T))
-        max_L = max(1, round(self.max_window_frac * T))
-
-        # If no CAM: define importance as |guide - x| aggregated over channels
-        if imp is None:
-            imp = np.abs(guide - x) if x.ndim == 1 else np.abs(guide - x).sum(axis=0)
-        elif imp.ndim != 1 or imp.shape[0] != T:
-            raise ValueError("Internal: importance must be (T,) at this point.")
-
-        # Precompute cumulative sum for argmax window queries
-        assert imp is not None
-        csum = np.concatenate([[0.0], np.cumsum(imp)])  # length T+1
-
-        # convenience to evaluate and check flip
-        def _predict_label(arr: np.ndarray) -> int:
-            cb, _ = ensure_batch_shape(arr)
-            return int(np.argmax(self.predict_proba(cb)[0]))
-
-        # linearly grow L until flip or max_L
-        L = init_L
-
-        def best_start_for_L(L_: int) -> int:
-            """Return the start index of the contiguous window of length L_ with
-            maximal importance sum."""
-
-            return int(np.argmax(csum[L_:] - csum[:-L_]))
-
-        while max_L >= L:
-            start = best_start_for_L(L)
-            cf = self._replace_window(x, guide, start, L)
-            cf_label = _predict_label(cf)
-            if cf_label != base_label:
-                return start, L, cf, cf_label
-            L += step
-
-        # Worst case: replace entire series
-        cf = self._replace_window(x, guide, 0, T)
-        cf_label = _predict_label(cf)
-        return 0, T, cf, cf_label
-
-    def _replace_window(self, x: np.ndarray, guide: np.ndarray, start: int, L: int) -> np.ndarray:
-        """Copy a contiguous window from guide into x.
-
-        Parameters
-        ----------
-        x : np.ndarray
-            Original time series of shape ``(T,)`` or ``(C, T)``.
-        guide : np.ndarray
-            Guide series with the same shape as ``x``.
-        start : int
-            Start index of the window to replace.
-        L : int
-            Length of the window to replace.
-
-        Returns
-        -------
-        np.ndarray
-            Modified series with window ``[start, start+L)`` replaced
-            from ``guide``.
-        """
-        end = min(start + L, x.shape[-1] if x.ndim == 2 else x.shape[0])
-        if x.ndim == 1:
-            out = x.copy()
-            out[start:end] = guide[start:end]
-            return out
+            guide, guide_meta = self._build_dba_guide(x1, base_idx)
         else:
-            out = x.copy()
-            out[:, start:end] = guide[:, start:end]
-            return out
+            guide, guide_meta = self._find_nearest_unlike_neighbor(x1, base_idx)
 
-    def _global_mean_like(self, X: np.ndarray) -> np.ndarray:
-        """Compute the global mean of the reference set.
+        # Step 2: Generate counterfactual using the chosen strategy
+        if self.method == "blend":
+            cf, cf_idx, beta = self._blend_query_with_guide(x1, guide, base_idx)
+            window_start, window_len = None, None
+        else:
+            importance = self._compute_cam_importance(guide) if self.method == "cam" else None
+            window_start, window_len, cf, cf_idx = self._grow_window_until_flip(
+                x1, guide, base_idx, importance
+            )
+            beta = None
 
-        Parameters
-        ----------
-        X : np.ndarray
-            Reference set of shape ``(N, T)`` or ``(N, C, T)``.
-
-        Returns
-        -------
-        np.ndarray
-            Mean series of shape ``(T,)`` or ``(C, T)``.
-
-        Raises
-        ------
-        ValueError
-            If ``X`` has unsupported number of dimensions.
-        """
-        if X.ndim == 2:  # (N, T)
-            mean_2d: np.ndarray = X.mean(axis=0)
-            return mean_2d
-        if X.ndim == 3:  # (N, C, T)
-            mean_3d: np.ndarray = X.mean(axis=0)
-            return mean_3d
-        raise ValueError(f"Unsupported X shape for mean: {X.shape}")
-
-    def _distance_vec(self, x: np.ndarray, Xc: np.ndarray) -> np.ndarray:
-        """Compute distances from query to candidate set.
-
-        Parameters
-        ----------
-        x : np.ndarray
-            Query time series of shape ``(T,)`` or ``(C, T)``.
-        Xc : np.ndarray
-            Candidate set of shape ``(N, T)`` or ``(N, C, T)``.
-
-        Returns
-        -------
-        np.ndarray
-            1-D array of distances of length ``N``.
-        """
-        if self.distance == "euclidean" or not TSLEARN_AVAILABLE:
-            xb, _ = ensure_batch_shape(x)
-            return euclidean_cdist_flat(xb, Xc).ravel()
-        return dtw_distance_vec_multich(x, Xc)
+        # Step 3: Assemble result
+        cf_label = self._idx_to_label(cf_idx)
+        meta = self._build_meta(
+            guide_meta, beta=beta, window_start=window_start, window_len=window_len
+        )
+        return cf, cf_label, meta
 
     def explain_k(
         self,
@@ -645,70 +323,57 @@ class NativeGuide(Counterfactual):
         xb, added = ensure_batch_shape(x)
         x1 = strip_batch(xb, added)
 
-        base_label = int(np.argmax(self.predict_proba(xb)[0])) if y_pred is None else int(y_pred)
+        if y_pred is None:
+            base_idx = int(np.argmax(self.predict_proba(xb)[0]))
+        else:
+            base_idx = self._label_to_idx(y_pred)
 
-        # Find k unlike neighbors to use as diverse guides
-        # Use pre-computed reference set predictions (computed once in __post_init__)
-        yhat = self._ref_yhat
-        unlike_mask = yhat != base_label
-
-        if not np.any(unlike_mask):
-            # No unlike neighbors - fall back to default behavior
+        # Step 1: Find k unlike neighbors to use as diverse guides
+        result = self._find_unlike_neighbors(x1, base_idx, k=k)
+        if result is None:
             return super().explain_k(x, k=k, y_pred=y_pred)
 
-        X_unlike = self.X_ref[unlike_mask]
-        dvec = self._distance_vec(x1, X_unlike)
-        order = np.argsort(dvec)
-        ref_indices = np.flatnonzero(unlike_mask)
+        distances, indices_in_unlike, ref_indices, X_unlike = result
 
-        # Generate CF for each of the k nearest unlike neighbors
+        # Step 2: Generate a counterfactual for each unlike neighbor
         cfs: list[np.ndarray] = []
         cf_labels: list[int] = []
         metas: list[dict[str, Any]] = []
 
-        n_available = min(k, len(order))
-        for i in range(n_available):
-            nun_in_unlike = int(order[i])
-            nun_index_in_ref = int(ref_indices[nun_in_unlike])
+        for i in range(len(indices_in_unlike)):
+            nun_in_unlike = int(indices_in_unlike[i])
             guide = X_unlike[nun_in_unlike]
-            neighbor_distance = float(dvec[nun_in_unlike])
+            guide_meta = {
+                "nun_index_in_X": int(ref_indices[nun_in_unlike]),
+                "neighbor_indices": None,
+                "neighbor_distance": float(distances[i]),
+            }
 
-            meta: dict[str, Any]
             if self.method == "blend":
-                cf, cf_label, beta = self._blend_search(x1, guide, base_label)
-                meta = {
-                    "method": self.method,
-                    "distance": self.distance,
-                    "k_index": i,
-                    "nun_index_in_X": nun_index_in_ref,
-                    "neighbor_indices": None,
-                    "neighbor_distance": neighbor_distance,
-                    "beta": beta,
-                    "window_start": None,
-                    "window_len": None,
-                }
+                cf, cf_idx, beta = self._blend_query_with_guide(x1, guide, base_idx)
+                window_start, window_len = None, None
             else:
-                imp = self._get_importance(x1, base_label)
-                start, L, cf, cf_label = self._window_growth_search(x1, guide, base_label, imp)
-                meta = {
-                    "method": self.method,
-                    "distance": self.distance,
-                    "k_index": i,
-                    "nun_index_in_X": nun_index_in_ref,
-                    "neighbor_indices": None,
-                    "neighbor_distance": neighbor_distance,
-                    "beta": None,
-                    "window_start": start,
-                    "window_len": L,
-                }
+                importance = self._compute_cam_importance(guide) if self.method == "cam" else None
+                window_start, window_len, cf, cf_idx = self._grow_window_until_flip(
+                    x1, guide, base_idx, importance
+                )
+                beta = None
 
+            cf_label = self._idx_to_label(cf_idx)
+            meta = self._build_meta(
+                guide_meta,
+                beta=beta,
+                window_start=window_start,
+                window_len=window_len,
+                k_index=i,
+            )
             cfs.append(cf)
             cf_labels.append(cf_label)
             metas.append(meta)
 
-        # If we have fewer than k unlike neighbors, pad with best result
+        # Step 3: Pad with nearest neighbor result if fewer than k available
         while len(cfs) < k:
-            best_idx = 0  # Use the nearest neighbor result
+            best_idx = 0
             cf = cfs[best_idx].copy()
             cf_label = cf_labels[best_idx]
             new_meta: dict[str, Any] = metas[best_idx].copy()
@@ -719,3 +384,517 @@ class NativeGuide(Counterfactual):
             metas.append(new_meta)
 
         return np.array(cfs), np.array(cf_labels), metas
+
+    def _find_nearest_unlike_neighbor(
+        self, x: np.ndarray, base_idx: int
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        """Find the single nearest unlike neighbor (NUN) from the reference set.
+
+        Used by the 'blend', 'ng', and 'cam' methods.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Query time series of shape ``(T,)`` or ``(C, T)``.
+        base_idx : int
+            Probability column index of the original predicted class.
+
+        Returns
+        -------
+        nun : np.ndarray
+            Nearest unlike neighbor with the same shape as ``x``.
+        metadata : dict
+            Dictionary with ``'nun_index_in_X'``, ``'neighbor_indices'``,
+            and ``'neighbor_distance'``.
+        """
+        result = self._find_unlike_neighbors(x, base_idx, k=1)
+        if result is None:
+            guide = self._fallback_global_mean(self.X_ref)
+            return guide, {
+                "nun_index_in_X": None,
+                "neighbor_indices": None,
+                "neighbor_distance": float(np.nan),
+                "failure_reason": "no_unlike_neighbors",
+            }
+
+        distances, indices_in_unlike, ref_indices, X_unlike = result
+        nun_in_unlike = int(indices_in_unlike[0])
+        nun = X_unlike[nun_in_unlike]
+        return nun, {
+            "nun_index_in_X": int(ref_indices[nun_in_unlike]),
+            "neighbor_indices": None,
+            "neighbor_distance": float(distances[0]),
+        }
+
+    def _build_dba_guide(self, x: np.ndarray, base_idx: int) -> tuple[np.ndarray, dict[str, Any]]:
+        """Build a DTW-DBA barycenter guide from k unlike neighbors.
+
+        Used by the 'dtw_dba' method.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Query time series of shape ``(T,)`` or ``(C, T)``.
+        base_idx : int
+            Probability column index of the original predicted class.
+
+        Returns
+        -------
+        guide : np.ndarray
+            DBA barycenter of k unlike neighbors, same shape as ``x``.
+        metadata : dict
+            Dictionary with ``'nun_index_in_X'``, ``'neighbor_indices'``,
+            and ``'neighbor_distance'``.
+        """
+        result = self._find_unlike_neighbors(x, base_idx, k=self.k_unlike)
+        if result is None:
+            guide = self._fallback_global_mean(self.X_ref)
+            return guide, {
+                "nun_index_in_X": None,
+                "neighbor_indices": None,
+                "neighbor_distance": float(np.nan),
+                "failure_reason": "no_unlike_neighbors",
+            }
+
+        distances, indices_in_unlike, ref_indices, X_unlike = result
+        nbrs = X_unlike[indices_in_unlike]
+        guide = dba_barycenter_multich(nbrs)
+        nun_in_unlike = int(indices_in_unlike[0])
+        return guide, {
+            "nun_index_in_X": int(ref_indices[nun_in_unlike]),
+            "neighbor_indices": ref_indices[indices_in_unlike].tolist(),
+            "neighbor_distance": float(distances[0]),
+        }
+
+    def _find_unlike_neighbors(
+        self, x: np.ndarray, base_idx: int, k: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+        """Find k unlike neighbors from the reference set.
+
+        Shared helper for both single-NUN and multi-neighbor retrieval.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Query time series of shape ``(T,)`` or ``(C, T)``.
+        base_idx : int
+            Probability column index of the original predicted class.
+        k : int
+            Number of unlike neighbors to retrieve.
+
+        Returns
+        -------
+        tuple or None
+            ``(distances, indices_in_unlike, ref_indices, X_unlike)`` if
+            unlike neighbors exist, otherwise ``None`` (with a warning).
+        """
+        yhat = self._ref_yhat
+        unlike_mask = yhat != base_idx
+        if not np.any(unlike_mask):
+            warnings.warn(
+                f"NativeGuide: No unlike neighbors found in reference set. "
+                f"The classifier predicts all {len(yhat)} reference samples as class "
+                f"{self._idx_to_label(base_idx)}. Falling back to global mean, which "
+                f"may not produce a valid counterfactual. Consider using a different "
+                f"dataset or classifier with more diverse predictions.",
+                UserWarning,
+                stacklevel=3,
+            )
+            return None
+
+        X_unlike = self.X_ref[unlike_mask]
+        ref_indices = np.flatnonzero(unlike_mask)
+        k_actual = min(k, len(X_unlike))
+
+        if TSLEARN_AVAILABLE:
+            distances, indices_in_unlike = self._find_k_neighbors_tslearn(x, X_unlike, k=k_actual)
+        else:
+            warnings.warn(
+                "tslearn is not installed. NativeGuide is using a manual fallback "
+                "for neighbor search instead of KNeighborsTimeSeries. "
+                "Install tslearn for the original algorithm: pip install tslearn",
+                UserWarning,
+                stacklevel=3,
+            )
+            dvec = self._compute_distances(x, X_unlike)
+            order = np.argsort(dvec)[:k_actual]
+            indices_in_unlike = order
+            distances = dvec[order]
+
+        return distances, indices_in_unlike, ref_indices, X_unlike
+
+    def _blend_query_with_guide(
+        self, x: np.ndarray, guide: np.ndarray, base_idx: int
+    ) -> tuple[np.ndarray, int, float]:
+        """Blend query with guide via weighted DTW barycenter averaging.
+
+        Incrementally increases the guide's influence (beta) until the model's
+        predicted class flips or the target probability is reached.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Query series of shape ``(T,)`` or ``(C, T)``.
+        guide : np.ndarray
+            Native guide (NUN) of same shape as ``x``.
+        base_idx : int
+            Probability column index of the original predicted class.
+
+        Returns
+        -------
+        cf : np.ndarray
+            Counterfactual series with the same shape as ``x``.
+        cf_idx : int
+            Probability column index for the counterfactual prediction.
+        beta : float
+            Final blending weight in ``[0, 1]``.
+        """
+        beta = 0.0
+        cf = x.copy()
+        cf_idx, alt_prob = self._predict_idx_and_max_alt_prob(cf, base_idx)
+
+        while alt_prob < self.target_prob and beta < 1.0:
+            beta = min(beta + self.beta_step, 1.0)
+            cf = weighted_dba_multich(x, guide, beta)
+            cf_idx, alt_prob = self._predict_idx_and_max_alt_prob(cf, base_idx)
+            if cf_idx != base_idx:
+                break
+
+        return cf, cf_idx, beta
+
+    def _compute_cam_importance(self, guide: np.ndarray) -> np.ndarray:
+        """Compute the CAM importance map from the guide's class activation.
+
+        Predicts the guide's class internally and passes it to the user-provided
+        ``cam_importance_fn``. This matches the original paper where the NUN's
+        CAM weights identify which region to swap.
+
+        Parameters
+        ----------
+        guide : np.ndarray
+            The native guide (NUN) of shape ``(T,)`` or ``(C, T)``.
+
+        Returns
+        -------
+        np.ndarray
+            Importance map of shape ``(T,)``.
+
+        Raises
+        ------
+        ValueError
+            If the shape returned by ``cam_importance_fn`` does not match
+            ``(T,)`` for univariate input or ``(T,)`` / ``(C, T)`` for
+            multivariate input.
+        """
+        assert self.cam_importance_fn is not None
+        guide_b, _ = ensure_batch_shape(guide)
+        guide_pred_idx = int(np.argmax(self.predict_proba(guide_b)[0]))
+        guide_label = self._idx_to_label(guide_pred_idx)
+        imp = np.asarray(self.cam_importance_fn(guide, guide_label))
+
+        if guide.ndim == 1:
+            if imp.ndim != 1 or imp.shape[0] != guide.shape[0]:
+                raise ValueError("cam_importance_fn must return shape (T,) for univariate input.")
+            return imp
+
+        # multivariate input: accept (T,) or (C, T)
+        if imp.ndim == 1:
+            if imp.shape[0] != guide.shape[1]:
+                raise ValueError("When returning (T,), length must match time length.")
+            return imp
+        if imp.ndim == 2 and imp.shape == guide.shape:
+            sum_result: np.ndarray = imp.sum(axis=0)
+            return sum_result
+        raise ValueError("cam_importance_fn must return (T,) or (C,T) for multivariate input.")
+
+    def _grow_window_until_flip(
+        self,
+        x: np.ndarray,
+        guide: np.ndarray,
+        base_idx: int,
+        importance: np.ndarray | None,
+    ) -> tuple[int, int, np.ndarray, int]:
+        """Grow a window from the guide into the query until the prediction flips.
+
+        Iteratively increases the window length, positioning it at the most
+        important region, and copies guide content into the query.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Query time series of shape ``(T,)`` or ``(C, T)``.
+        guide : np.ndarray
+            Native guide series with the same shape as ``x``.
+        base_idx : int
+            Probability column index of the original predicted class.
+        importance : np.ndarray or None
+            Importance map of shape ``(T,)``. If ``None``, uses
+            ``|guide - x|`` as a heuristic.
+
+        Returns
+        -------
+        start : int
+            Start index of the replacement window.
+        length : int
+            Length of the replacement window.
+        cf : np.ndarray
+            Counterfactual series with the same shape as ``x``.
+        cf_idx : int
+            Probability column index for the counterfactual prediction.
+
+        Raises
+        ------
+        ValueError
+            If ``importance`` is not ``None`` and its shape is not ``(T,)``.
+        """
+        T = x.shape[-1] if x.ndim == 2 else x.shape[0]
+
+        # Compute importance if not provided (heuristic: |guide - x|)
+        if importance is None:
+            importance = np.abs(guide - x) if x.ndim == 1 else np.abs(guide - x).sum(axis=0)
+        elif importance.ndim != 1 or importance.shape[0] != T:
+            raise ValueError("Internal: importance must be (T,) at this point.")
+
+        # Precompute cumulative sum for fast window-start queries
+        cumsum = np.concatenate([[0.0], np.cumsum(importance)])
+
+        # Grow window from length 1 to T, checking for flip at each step
+        length = 1
+        while length <= T:
+            start = self._best_window_start(cumsum, length)
+            cf = self._splice_guide_segment(x, guide, start, length)
+            cf_idx = self._predict_class_idx(cf)
+            if cf_idx != base_idx:
+                return start, length, cf, cf_idx
+            length += 1
+
+        # Worst case: replace entire series
+        cf = self._splice_guide_segment(x, guide, 0, T)
+        cf_idx = self._predict_class_idx(cf)
+        return 0, T, cf, cf_idx
+
+    def _predict_class_idx(self, arr: np.ndarray) -> int:
+        """Return the predicted probability column index for a series.
+
+        Parameters
+        ----------
+        arr : np.ndarray
+            Time series of shape ``(T,)`` or ``(C, T)``.
+
+        Returns
+        -------
+        int
+            Argmax index of the model's probability vector.
+        """
+        cb, _ = ensure_batch_shape(arr)
+        return int(np.argmax(self.predict_proba(cb)[0]))
+
+    def _predict_idx_and_max_alt_prob(self, arr: np.ndarray, base_idx: int) -> tuple[int, float]:
+        """Predict class index and highest non-base probability.
+
+        Parameters
+        ----------
+        arr : np.ndarray
+            Time series of shape ``(T,)`` or ``(C, T)``.
+        base_idx : int
+            Probability column index of the base (original) class.
+
+        Returns
+        -------
+        pred_idx : int
+            Argmax index of the model's probability vector.
+        alt_prob : float
+            Highest probability among classes other than ``base_idx``.
+        """
+        cb, _ = ensure_batch_shape(arr)
+        probs = self.predict_proba(cb)[0]
+        pred_idx = int(np.argmax(probs))
+        alt_prob = max((p for i, p in enumerate(probs) if i != base_idx), default=0.0)
+        return pred_idx, alt_prob
+
+    @staticmethod
+    def _best_window_start(cumsum: np.ndarray, length: int) -> int:
+        """Return the start index maximising importance over a window.
+
+        Uses a precomputed cumulative sum for O(1) window-sum queries.
+
+        Parameters
+        ----------
+        cumsum : np.ndarray
+            Cumulative sum of the importance map, of length ``T + 1``
+            (prepended with 0).
+        length : int
+            Window length to evaluate.
+
+        Returns
+        -------
+        int
+            Start index of the window with the highest total importance.
+        """
+        return int(np.argmax(cumsum[length:] - cumsum[:-length]))
+
+    def _splice_guide_segment(
+        self, x: np.ndarray, guide: np.ndarray, start: int, length: int
+    ) -> np.ndarray:
+        """Copy a contiguous segment from guide into x.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Original time series of shape ``(T,)`` or ``(C, T)``.
+        guide : np.ndarray
+            Guide series with the same shape as ``x``.
+        start : int
+            Start index of the segment to replace.
+        length : int
+            Length of the segment to replace.
+
+        Returns
+        -------
+        np.ndarray
+            Modified series with ``[start, start+length)`` replaced from guide.
+        """
+        end = min(start + length, x.shape[-1] if x.ndim == 2 else x.shape[0])
+        out = x.copy()
+        if x.ndim == 1:
+            out[start:end] = guide[start:end]
+        else:
+            out[:, start:end] = guide[:, start:end]
+        return out
+
+    def _fallback_global_mean(self, X: np.ndarray) -> np.ndarray:
+        """Compute the global mean of the reference set (fallback guide).
+
+        Used when no unlike neighbors exist in the reference set.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Reference set of shape ``(N, T)`` or ``(N, C, T)``.
+
+        Returns
+        -------
+        np.ndarray
+            Mean series of shape ``(T,)`` or ``(C, T)``.
+
+        Raises
+        ------
+        ValueError
+            If ``X`` has fewer than 2 or more than 3 dimensions.
+        """
+        if X.ndim in (2, 3):
+            result: np.ndarray = X.mean(axis=0)
+            return result
+        raise ValueError(f"Unsupported X shape for mean: {X.shape}")
+
+    def _compute_distances(self, x: np.ndarray, X_candidates: np.ndarray) -> np.ndarray:
+        """Compute distances from query to candidate set.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Query time series of shape ``(T,)`` or ``(C, T)``.
+        X_candidates : np.ndarray
+            Candidate set of shape ``(N, T)`` or ``(N, C, T)``.
+
+        Returns
+        -------
+        np.ndarray
+            1-D array of distances of length ``N``.
+        """
+        if self.distance != "euclidean" and not TSLEARN_AVAILABLE:
+            warnings.warn(
+                f"NativeGuide: distance='{self.distance}' was requested but tslearn "
+                f"is not installed. Falling back to Euclidean distance. "
+                f"Install tslearn for DTW support: pip install tslearn",
+                UserWarning,
+                stacklevel=2,
+            )
+        if self.distance == "euclidean" or not TSLEARN_AVAILABLE:
+            xb, _ = ensure_batch_shape(x)
+            return euclidean_cdist_flat(xb, X_candidates).ravel()
+        return dtw_distance_vec_multich(x, X_candidates)
+
+    def _find_k_neighbors_tslearn(
+        self, x: np.ndarray, X_candidates: np.ndarray, k: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Find k nearest neighbors using tslearn's KNeighborsTimeSeries.
+
+        Handles shape conversion between codebase convention ``(N, C, T)``
+        and tslearn convention ``(N, T, C)``.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Query series of shape ``(T,)`` or ``(C, T)``.
+        X_candidates : np.ndarray
+            Candidate set of shape ``(N, T)`` or ``(N, C, T)``.
+        k : int
+            Number of neighbors to find.
+
+        Returns
+        -------
+        distances : np.ndarray
+            1-D array of k distances.
+        indices : np.ndarray
+            1-D array of k indices into ``X_candidates``.
+        """
+        if X_candidates.ndim == 2:
+            X_tl = X_candidates[:, :, np.newaxis]
+        else:
+            X_tl = np.transpose(X_candidates, (0, 2, 1))
+
+        q_tl = x[np.newaxis, :, np.newaxis] if x.ndim == 1 else x.T[np.newaxis, :, :]
+
+        knn = KNeighborsTimeSeries(n_neighbors=k, metric=self.distance)
+        knn.fit(X_tl)
+        dists, inds = knn.kneighbors(q_tl, return_distance=True)
+        return dists[0], inds[0]
+
+    def _build_meta(
+        self,
+        guide_meta: dict[str, Any],
+        *,
+        beta: float | None = None,
+        window_start: int | None = None,
+        window_len: int | None = None,
+        k_index: int | None = None,
+    ) -> dict[str, Any]:
+        """Build the metadata dictionary for an explanation result.
+
+        Parameters
+        ----------
+        guide_meta : dict
+            Metadata from guide retrieval, containing ``'nun_index_in_X'``,
+            ``'neighbor_indices'``, and ``'neighbor_distance'``.
+        beta : float or None
+            Blending weight (only for ``method='blend'``).
+        window_start : int or None
+            Start index of the replacement window (window-based methods).
+        window_len : int or None
+            Length of the replacement window (window-based methods).
+        k_index : int or None
+            Index of this result within a ``explain_k`` batch. Omitted
+            from the dict when ``None``.
+
+        Returns
+        -------
+        dict
+            Metadata dictionary with keys ``method``, ``distance``,
+            ``nun_index_in_X``, ``neighbor_indices``, ``neighbor_distance``,
+            ``beta``, ``window_start``, and ``window_len`` (plus ``k_index``
+            when applicable).
+        """
+        meta: dict[str, Any] = {
+            "method": self.method,
+            "distance": self.distance,
+            "nun_index_in_X": guide_meta.get("nun_index_in_X"),
+            "neighbor_indices": guide_meta.get("neighbor_indices"),
+            "neighbor_distance": guide_meta.get("neighbor_distance"),
+            "beta": beta,
+            "window_start": window_start,
+            "window_len": window_len,
+        }
+        if k_index is not None:
+            meta["k_index"] = k_index
+        return meta

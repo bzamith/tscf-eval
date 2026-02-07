@@ -6,13 +6,13 @@ explanations in time series classification.
 This package provides:
 
 - **Counterfactual Explainers** (:mod:`tscf_eval.counterfactuals`): Implementations
-  of five counterfactual explanation methods for time series: CoMTE,
-  NativeGuide, TSEvo, Glacier, and LatentCF.
+  of seven counterfactual explanation methods for time series: CELS, CoMTE,
+  NativeGuide, SETS, TSEvo, Glacier, and LatentCF.
 
-- **Evaluation Metrics** (:mod:`tscf_eval.evaluator`): 10 metrics organized
+- **Evaluation Metrics** (:mod:`tscf_eval.evaluator`): 11 metrics organized
   into six quality dimensions for assessing counterfactual quality (validity,
   proximity, sparsity, plausibility, diversity, contiguity, composition,
-  confidence, robustness, efficiency).
+  controllability, confidence, robustness, efficiency).
 
 - **Data Loaders** (:mod:`tscf_eval.data_loader`): Utilities for loading time
   series classification datasets, including the UCR archive.
@@ -39,6 +39,11 @@ References
 ----------
 The counterfactual methods in this package are based on the following papers:
 
+- **CELS**: Li, P., Tang, B., & Ning, Y. (2023).
+  CELS: Counterfactual Explanation of Time-Series via Learned Saliency Maps.
+  IEEE International Conference on Big Data 2023, pp. 1952-1957.
+  Original implementation: https://github.com/Luckilyeee/CELS
+
 - **CoMTE**: Ates, E., Aksar, B., Leung, V. J., & Coskun, A. K. (2021).
   Counterfactual Explanations for Multivariate Time Series. ICAPAI 2021.
   Original implementation: https://github.com/peaclab/CoMTE
@@ -46,6 +51,10 @@ The counterfactual methods in this package are based on the following papers:
 - **NativeGuide**: Delaney, E., Greene, D., & Keane, M. T. (2021).
   Instance-based Counterfactual Explanations for Time Series Classification.
   ICCBR 2021. Original implementation: https://github.com/e-delaney/Instance-Based_CFE_TSC
+
+- **SETS**: Bahri, O., Filali Boubrahimi, S., & Hamdi, S. M. (2022).
+  Shapelet-Based Counterfactual Explanations for Multivariate Time Series.
+  KDD-MiLeTS 2022. Original implementation: https://github.com/omarbahri/SETS
 
 - **TSEvo**: Höllig, J., Kulbach, C., & Thoma, S. (2022).
   TSEvo: Evolutionary Counterfactual Explanations for Time Series Classification.
@@ -83,7 +92,9 @@ from tscf_eval.benchmark import (
     friedman_test,
 )
 from tscf_eval.counterfactuals import (
+    CELS,
     COMTE,
+    SETS,
     Counterfactual,
     Glacier,
     LatentCF,
@@ -108,7 +119,9 @@ from tscf_eval.evaluator import (
 )
 
 __all__ = [
+    "CELS",
     "COMTE",
+    "SETS",
     "BenchmarkResults",
     "BenchmarkRunner",
     "Composition",

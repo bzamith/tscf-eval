@@ -7,11 +7,11 @@
 **TSCFEval** is a model-agnostic Python framework for systematic evaluation of counterfactual explanations in Time Series Classification (TSC). Unlike existing libraries that focus on counterfactual generation, TSCFEval is specifically designed for counterfactual evaluation, consolidating fragmented evaluation practices from the TSC counterfactual literature into a unified, extensible toolkit.
 
 Given a time series classifier and a set of counterfactual explanations, TSCFEval provides:
-- **10 evaluation metrics** organized into **six quality dimensions** (core quality, distribution alignment, structural properties, model behavior, stability, and computational performance)
+- **11 evaluation metrics** organized into **six quality dimensions** (core quality, distribution alignment, structural properties, model behavior, stability, and computational performance)
 - **Weighted scalarization** for aggregating metrics into composite scores, enabling customizable method ranking
 - **Confidence-stratified instance selection** for benchmarking across the decision boundary
 - **Three benchmarking scenarios**: single dataset with multiple CF methods, single dataset with multiple classifiers, and multiple datasets with a fixed classifier
-- **5 built-in CF methods** for generating counterfactuals
+- **7 built-in CF methods** for generating counterfactuals
 - **Multi-criteria analysis** for principled multi-criteria comparison
 
 ## Table of Contents
@@ -55,27 +55,30 @@ cd tscf-eval && pip install -e .
 
 | Method | Strategy | Description | Reference |
 |--------|----------|-------------|-----------|
+| `CELS` | Saliency map | Learned saliency map blending with nearest unlike neighbor | Li et al., 2023 |
 | `NativeGuide` | Instance-based | Nearest unlike neighbor guidance with four variants (blend, ng, dtw_dba, cam) | Delaney et al., 2021 |
 | `COMTE` | Instance-based | Greedy channel substitution for multivariate TS | Ates et al., 2021 |
+| `SETS` | Shapelet-based | Class-specific shapelet manipulation with contiguous perturbations | Bahri et al., 2022 |
 | `TSEvo` | Evolutionary | Multi-objective optimization via NSGA-II with three mutation operators | Hollig et al., 2022 |
 | `Glacier` | Gradient-based | Gradient optimization with importance-weighted proximity constraints | Wang et al., 2024 |
 | `LatentCF` | Gradient-based | Latent space optimization with local/global importance weighting | Wang et al., 2021 |
 
 ### Evaluation Metrics
 
-TSCFEval implements 10 metrics organized into six quality dimensions:
+TSCFEval implements 11 metrics organized into six quality dimensions:
 
 | Dimension | Metric | Description | Direction | Reference |
 |-----------|--------|-------------|-----------|-----------|
-| **Core Quality** | `Validity` | Fraction of CFs that flip the prediction | maximize | Li et al., 2023 |
-| | `Proximity` | Closeness to original instance (L1, L2, L-inf norms) | maximize | Delaney et al., 2021; Bahri et al., 2022 |
+| **Core Quality** | `Validity` | Fraction of CFs that flip the prediction (hard or soft mode) | maximize | Li et al., 2023 |
+| | `Proximity` | Closeness to original instance (L1, L2, L-inf, DTW) | maximize | Delaney et al., 2021; Bahri et al., 2022 |
 | | `Sparsity` | Fraction of changed features | minimize | Mothilal et al., 2020 |
-| **Distribution** | `Plausibility` | Whether CFs lie within data distribution (LOF, IF, MP-OCSVM) | maximize | Breunig et al., 2000; Liu et al., 2008 |
-| | `Diversity` | Variety among multiple CFs (DPP-based) | maximize | Mothilal et al., 2020 |
+| **Distribution** | `Plausibility` | Whether CFs lie within data distribution (LOF, IF, MP-OCSVM, DTW-LOF) | maximize | Breunig et al., 2000; Liu et al., 2008 |
+| | `Diversity` | Variety among multiple CFs via DPP (Euclidean or DTW) | maximize | Mothilal et al., 2020 |
 | **Structure** | `Contiguity` | How contiguous the edits are | maximize | Delaney et al., 2021; Ates et al., 2021 |
 | | `Composition` | Number and length of edit segments | minimize | Delaney et al., 2021; Ates et al., 2021 |
 | **Model Behavior** | `Confidence` | Model confidence on original and CF predictions | maximize | Le et al., 2023 |
-| **Stability** | `Robustness` | Local Lipschitz-like stability to input perturbations | minimize | Ates et al., 2021 |
+| | `Controllability` | Ease of reverting CF changes via single-feature edits | maximize | Verma et al., 2024 |
+| **Stability** | `Robustness` | Local Lipschitz-like stability to input perturbations (Euclidean or DTW) | minimize | Ates et al., 2021 |
 | **Performance** | `Efficiency` | Generation time per instance | minimize | Li et al., 2023 |
 
 ---
@@ -99,14 +102,14 @@ y_cf = np.ones(10)                 # CF labels
 # Create evaluator
 evaluator = Evaluator([
     Validity(),
-    Proximity(p=2),
+    Proximity(p=2, distance="lp"),
     Sparsity(),
 ])
 
 # Evaluate
 results = evaluator.evaluate(X, X_cf, y=y, y_cf=y_cf)
 print(results)
-# {'validity': 1.0, 'proximity_l2': 0.99, 'sparsity': 0.0}
+# keys: validity, proximity_l2, sparsity
 ```
 
 ### Using Built-in CF Methods
@@ -169,7 +172,7 @@ runner = BenchmarkRunner(
         ExplainerConfig("ng_blend", NativeGuide, {"method": "blend"}),
         ExplainerConfig("tsevo", TSEvo, {"n_generations": 50}),
     ],
-    evaluator=Evaluator([Validity(), Proximity(p=2), Sparsity()]),
+    evaluator=Evaluator([Validity(), Proximity(p=2, distance="lp"), Sparsity()]),
     n_instances=12,
     instance_selection="stratified_confidence",  # Confidence-stratified selection
 )
@@ -189,10 +192,7 @@ Find Pareto-optimal methods balancing multiple objectives:
 from tscf_eval.benchmark import ParetoAnalyzer
 
 analyzer = ParetoAnalyzer(metrics=[
-    "validity", "proximity_linf", "sparsity",
-    "plausibility_if", "diversity_dpp",
-    "contiguity", "mean_n_segments",
-    "mean_conf_cf", "robustness_lipschitz", "efficiency_time_s",
+    "validity", "proximity_l2", "sparsity",
 ])
 
 # Dominance ranking
@@ -214,18 +214,15 @@ from tscf_eval.benchmark import WeightedScalarizer
 
 # Equal-weight composite across all metrics
 scalarizer = WeightedScalarizer(metrics=[
-    "validity", "proximity_linf", "sparsity",
-    "plausibility_if", "diversity_dpp",
-    "contiguity", "mean_n_segments",
-    "mean_conf_cf", "robustness_lipschitz", "efficiency_time_s",
+    "validity", "proximity_l2", "sparsity",
 ])
 scores = scalarizer.score(results)
 print(scores)  # Ranked by composite score
 
 # Custom weights emphasizing validity
 scalarizer = WeightedScalarizer(
-    metrics=["validity", "proximity_linf", "sparsity"],
-    weights={"validity": 3.0, "proximity_linf": 1.0, "sparsity": 1.0},
+    metrics=["validity", "proximity_l2", "sparsity"],
+    weights={"validity": 3.0, "proximity_l2": 1.0, "sparsity": 1.0},
 )
 
 # Sensitivity analysis: how ranking changes as one metric's weight varies
@@ -319,9 +316,13 @@ If you use TSCFEval in your research, please cite our paper:
 
 ### Counterfactual Methods
 
+- **CELS**: Li, P., Tang, B., & Ning, Y. (2023). *CELS: Counterfactual Explanation of Time-Series via Learned Saliency Maps*. IEEE International Conference on Big Data 2023, pp. 1952-1957. [[Paper](https://doi.org/10.1109/BigData59044.2023.10386404)] [[Code](https://github.com/Luckilyeee/CELS)]
+
 - **CoMTE**: Ates, E., Aksar, B., Leung, V. J., & Coskun, A. K. (2021). *Counterfactual Explanations for Multivariate Time Series*. ICAPAI 2021. [[Paper](https://doi.org/10.1109/ICAPAI49758.2021.9462056)] [[Code](https://github.com/peaclab/CoMTE)]
 
 - **NativeGuide**: Delaney, E., Greene, D., & Keane, M. T. (2021). *Instance-Based Counterfactual Explanations for Time Series Classification*. ICCBR 2021. [[Paper](https://doi.org/10.1007/978-3-030-86957-1_3)] [[Code](https://github.com/e-delaney/Instance-Based_CFE_TSC)]
+
+- **SETS**: Bahri, O., Filali Boubrahimi, S., & Hamdi, S. M. (2022). *Shapelet-Based Counterfactual Explanations for Multivariate Time Series*. KDD-MiLeTS 2022. [[Paper](https://arxiv.org/abs/2208.10462)] [[Code](https://github.com/omarbahri/SETS)]
 
 - **TSEvo**: Hollig, J., Kulbach, C., & Thoma, S. (2022). *TSEvo: Evolutionary Counterfactual Explanations for Time Series Classification*. ICMLA 2022. [[Paper](https://doi.org/10.1109/ICMLA55696.2022.00013)] [[Code](https://github.com/JHoelli/TSEvo)]
 
@@ -346,6 +347,8 @@ If you use TSCFEval in your research, please cite our paper:
 - **Composition, Contiguity**: Delaney et al. (2021). ICCBR 2021; Ates et al. (2021). ICAPAI 2021.
 
 - **Confidence**: Le, T., Miller, T., Singh, R., & Sonenberg, L. (2023). *Explaining model confidence using counterfactuals*. AAAI 2023. [[Paper](https://doi.org/10.1609/aaai.v37i10.26399)]
+
+- **Controllability**: Verma, S., Boonsanong, V., Hoang, M., Hines, K. E., Dickerson, J. P., & Shah, C. (2024). *Counterfactual Explanations for Machine Learning: Challenges Revisited*. ACM Computing Surveys, 56(12), Article 304. [[Paper](https://doi.org/10.1145/3677119)]
 
 - **Robustness**: Ates et al. (2021). ICAPAI 2021.
 

@@ -12,6 +12,7 @@ from tscf_eval.counterfactuals.utils import (
     dtw_distance_vec_multich,
     ensure_batch_shape,
     euclidean_cdist_flat,
+    has_expensive_transform,
     predict_proba_fn,
     soft_predict_proba_fn,
     strip_batch,
@@ -289,6 +290,66 @@ class TestSupportsSoftProbabilities:
 
         # KNN doesn't have decision_function, so falls back to True
         assert supports_soft_probabilities(clf) is True
+
+
+class TestHasExpensiveTransform:
+    """Tests for has_expensive_transform function."""
+
+    def test_knn_not_expensive(self, univariate_data: tuple[np.ndarray, np.ndarray]) -> None:
+        """Test that KNN is not flagged as expensive."""
+        X, y = univariate_data
+        clf = KNeighborsClassifier(n_neighbors=3)
+        clf.fit(X, y)
+
+        assert has_expensive_transform(clf) is False
+
+    def test_logistic_regression_not_expensive(
+        self, univariate_data: tuple[np.ndarray, np.ndarray]
+    ) -> None:
+        """Test that LogisticRegression is not flagged as expensive."""
+        X, y = univariate_data
+        clf = LogisticRegression(max_iter=200)
+        clf.fit(X, y)
+
+        assert has_expensive_transform(clf) is False
+
+    def test_rocket_by_class_name(self) -> None:
+        """Test that ROCKET-style classifiers are detected by class name."""
+
+        class RocketClassifier:
+            pass
+
+        assert has_expensive_transform(RocketClassifier()) is True
+
+    def test_rdst_by_class_name(self) -> None:
+        """Test that RDST classifiers are detected by class name."""
+
+        class RDSTClassifier:
+            pass
+
+        assert has_expensive_transform(RDSTClassifier()) is True
+
+    def test_rocket_by_transformer_attribute(self) -> None:
+        """Test detection via _transformer attribute with known expensive transformer."""
+
+        class Rocket:
+            pass
+
+        class PipelineModel:
+            _transformer = Rocket()
+
+        assert has_expensive_transform(PipelineModel()) is True
+
+    def test_cheap_transformer_not_flagged(self) -> None:
+        """Test that a model with a non-expensive transformer is not flagged."""
+
+        class StandardScaler:
+            pass
+
+        class PipelineModel:
+            _transformer = StandardScaler()
+
+        assert has_expensive_transform(PipelineModel()) is False
 
 
 # =============================================================================

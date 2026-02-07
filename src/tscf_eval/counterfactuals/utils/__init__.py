@@ -29,18 +29,20 @@ dtw_distance_vec_multich
 
 DTW/DBA Utilities (_dba)
 ------------------------
-dtw_pair_average
-    DTW-based pairwise averaging of two sequences.
-weighted_dba_pair
-    Weighted DTW barycenter averaging for two sequences.
 weighted_dba_multich
     Weighted DTW barycenter averaging per channel (multivariate).
 dba_barycenter_multich
     DTW barycenter averaging for multiple sequences.
-replace_topk_univariate
-    Replace top-k important points in univariate series.
-replace_topk_multivariate
-    Replace top-k important entries in multivariate series.
+
+Adam Optimizer (_adam)
+---------------------
+AdamState
+    Stateful Adam optimizer for NumPy gradient-based optimization loops.
+
+Nearest Unlike Neighbor (_nun)
+------------------------------
+find_nearest_unlike_neighbor
+    Find the nearest instance(s) from a reference set belonging to a target class.
 
 Notes
 -----
@@ -50,33 +52,35 @@ Optional dependencies:
 - ``scipy``: Used for optimized pairwise distance computation when available.
 """
 
+from ._adam import AdamState
 from ._dba import (
     dba_barycenter_multich,
-    dtw_pair_average,
-    replace_topk_multivariate,
-    replace_topk_univariate,
     weighted_dba_multich,
-    weighted_dba_pair,
 )
 from ._distance import (
     dtw_distance_vec_multich,
     euclidean_cdist_flat,
 )
-from ._predict import predict_proba_fn, soft_predict_proba_fn, supports_soft_probabilities
+from ._nun import find_nearest_unlike_neighbor
+from ._predict import (
+    has_expensive_transform,
+    predict_proba_fn,
+    soft_predict_proba_fn,
+    supports_soft_probabilities,
+)
 from ._shape import ensure_batch_shape, strip_batch
 
 __all__ = [
+    "AdamState",
     "dba_barycenter_multich",
     "dtw_distance_vec_multich",
-    "dtw_pair_average",
     "ensure_batch_shape",
     "euclidean_cdist_flat",
+    "find_nearest_unlike_neighbor",
+    "has_expensive_transform",
     "predict_proba_fn",
-    "replace_topk_multivariate",
-    "replace_topk_univariate",
     "soft_predict_proba_fn",
     "strip_batch",
     "supports_soft_probabilities",
     "weighted_dba_multich",
-    "weighted_dba_pair",
 ]

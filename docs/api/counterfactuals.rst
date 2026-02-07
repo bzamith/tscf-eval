@@ -18,6 +18,17 @@ Base Class
 Implementations
 ---------------
 
+CELS
+~~~~
+
+Counterfactual explanations via learned saliency maps that blend the original
+instance with its nearest unlike neighbor. Based on Li et al. (2023).
+
+.. autoclass:: tscf_eval.CELS
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 CoMTE
 ~~~~~
 
@@ -36,6 +47,18 @@ Instance-based counterfactual explanations using nearest unlike neighbor guidanc
 with DTW barycenter averaging. Based on Delaney et al. (2021).
 
 .. autoclass:: tscf_eval.NativeGuide
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+SETS
+~~~~
+
+Shapelet-based counterfactual explanations using class-specific shapelet
+manipulation with contiguous perturbations.
+Based on Bahri et al. (2022).
+
+.. autoclass:: tscf_eval.SETS
    :members:
    :undoc-members:
    :show-inheritance:
@@ -79,8 +102,10 @@ References
 
 The counterfactual methods implemented in this module are based on the following papers:
 
+- Li, P., Tang, B., & Ning, Y. (2023). "CELS: Counterfactual Explanation of Time-Series via Learned Saliency Maps." In *Proceedings of the IEEE International Conference on Big Data 2023*, pp. 1952-1957. IEEE. `[Paper] <https://doi.org/10.1109/BigData59044.2023.10386404>`_ `[Code] <https://github.com/Luckilyeee/CELS>`_
 - Ates, E., Aksar, B., Leung, V. J., & Coskun, A. K. (2021). "Counterfactual Explanations for Multivariate Time Series." In *Proceedings of the 2021 International Conference on Applied Artificial Intelligence (ICAPAI)*, pp. 1-8. `[Paper] <https://doi.org/10.1109/ICAPAI49758.2021.9462056>`_ `[Code] <https://github.com/peaclab/CoMTE>`_
 - Delaney, E., Greene, D., & Keane, M. T. (2021). "Instance-Based Counterfactual Explanations for Time Series Classification." In *Case-Based Reasoning Research and Development (ICCBR 2021)*, pp. 32-47. Springer. `[Paper] <https://doi.org/10.1007/978-3-030-86957-1_3>`_ `[Code] <https://github.com/e-delaney/Instance-Based_CFE_TSC>`_
+- Bahri, O., Filali Boubrahimi, S., & Hamdi, S. M. (2022). "Shapelet-Based Counterfactual Explanations for Multivariate Time Series." In *Proceedings of the ACM SIGKDD Workshop on Mining and Learning from Time Series (KDD-MiLeTS 2022)*. `[Paper] <https://arxiv.org/abs/2208.10462>`_ `[Code] <https://github.com/omarbahri/SETS>`_
 - Höllig, J., Kulbach, C., & Thoma, S. (2022). "TSEvo: Evolutionary Counterfactual Explanations for Time Series Classification." In *Proceedings of the 21st IEEE International Conference on Machine Learning and Applications (ICMLA 2022)*, pp. 29-36. `[Paper] <https://doi.org/10.1109/ICMLA55696.2022.00013>`_ `[Code] <https://github.com/JHoelli/TSEvo>`_
 - Wang, Z., Samsten, I., Miliou, I., Mochaourab, R., & Papapetrou, P. (2024). "Glacier: Guided Locally Constrained Counterfactual Explanations for Time Series Classification." *Machine Learning*, 113(3). `[Paper] <https://doi.org/10.1007/s10994-023-06502-x>`_ `[Code] <https://github.com/zhendong3wang/learning-time-series-counterfactuals>`_
 - Wang, Z., Samsten, I., Mochaourab, R., & Papapetrou, P. (2021). "Learning Time Series Counterfactuals via Latent Space Representations." In *International Conference on Discovery Science (DS 2021)*, Lecture Notes in Computer Science, vol 12986, pp. 369-384. Springer. `[Paper] <https://doi.org/10.1007/978-3-030-88942-5_29>`_ `[Code] <https://github.com/zhendong3wang/learning-time-series-counterfactuals>`_

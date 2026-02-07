@@ -60,33 +60,76 @@ class ExplainerResult:
 
     @property
     def n_instances(self) -> int:
-        """Number of test instances."""
+        """Return the number of test instances.
+
+        Returns
+        -------
+        int
+            Length of ``X_cf`` along axis 0.
+        """
         return len(self.X_cf)
 
     @property
     def n_successful(self) -> int:
-        """Number of successfully generated counterfactuals."""
+        """Return the number of successfully generated counterfactuals.
+
+        Returns
+        -------
+        int
+            Count of ``True`` values in ``success_mask``.
+        """
         return int(np.sum(self.success_mask))
 
     @property
     def success_rate(self) -> float:
-        """Fraction of successful generations."""
+        """Return the fraction of successful generations.
+
+        Returns
+        -------
+        float
+            Ratio ``n_successful / n_instances``, in ``[0, 1]``.
+        """
         return self.n_successful / self.n_instances if self.n_instances > 0 else 0.0
 
     @property
     def mean_time(self) -> float:
-        """Mean generation time per instance in seconds."""
+        """Return the mean generation time per instance in seconds.
+
+        Returns
+        -------
+        float
+            Average of ``generation_times``, or ``0.0`` if empty.
+        """
         if not self.generation_times:
             return 0.0
         return float(np.mean(self.generation_times))
 
     @property
     def total_time(self) -> float:
-        """Total generation time in seconds."""
+        """Return the total generation time in seconds.
+
+        Returns
+        -------
+        float
+            Sum of ``generation_times``.
+        """
         return float(np.sum(self.generation_times))
 
     def get_metric(self, name: str, default: Any = None) -> Any:
-        """Get a metric value by name, with optional default."""
+        """Get a metric value by name, with optional default.
+
+        Parameters
+        ----------
+        name : str
+            Metric key to look up in ``self.metrics``.
+        default : Any, default None
+            Value to return if the metric is not found.
+
+        Returns
+        -------
+        Any
+            The metric value, or *default* if not present.
+        """
         return self.metrics.get(name, default)
 
 
@@ -115,7 +158,13 @@ class BenchmarkResults:
     _results: dict[tuple[str, str, str], ExplainerResult] = field(default_factory=dict)
 
     def add(self, result: ExplainerResult) -> None:
-        """Add a result to the collection."""
+        """Add a result to the collection.
+
+        Parameters
+        ----------
+        result : ExplainerResult
+            Result to store, keyed by (dataset, model, explainer).
+        """
         key = (result.dataset_name, result.model_name, result.explainer_name)
         self._results[key] = result
 
@@ -125,30 +174,75 @@ class BenchmarkResults:
         model: str,
         explainer: str,
     ) -> ExplainerResult | None:
-        """Get result for a specific combination."""
+        """Get the result for a specific (dataset, model, explainer) combination.
+
+        Parameters
+        ----------
+        dataset : str
+            Dataset name.
+        model : str
+            Model name.
+        explainer : str
+            Explainer name.
+
+        Returns
+        -------
+        ExplainerResult or None
+            The matching result, or ``None`` if not found.
+        """
         return self._results.get((dataset, model, explainer))
 
     def __iter__(self) -> Iterator[ExplainerResult]:
-        """Iterate over all results."""
+        """Iterate over all stored results.
+
+        Returns
+        -------
+        Iterator[ExplainerResult]
+            Iterator yielding each result.
+        """
         return iter(self._results.values())
 
     def __len__(self) -> int:
-        """Number of results."""
+        """Return the number of stored results.
+
+        Returns
+        -------
+        int
+            Total number of (dataset, model, explainer) entries.
+        """
         return len(self._results)
 
     @property
     def datasets(self) -> list[str]:
-        """List of unique dataset names."""
+        """Return the sorted list of unique dataset names.
+
+        Returns
+        -------
+        list[str]
+            Unique dataset names across all stored results.
+        """
         return sorted({k[0] for k in self._results})
 
     @property
     def models(self) -> list[str]:
-        """List of unique model names."""
+        """Return the sorted list of unique model names.
+
+        Returns
+        -------
+        list[str]
+            Unique model names across all stored results.
+        """
         return sorted({k[1] for k in self._results})
 
     @property
     def explainers(self) -> list[str]:
-        """List of unique explainer names."""
+        """Return the sorted list of unique explainer names.
+
+        Returns
+        -------
+        list[str]
+            Unique explainer names across all stored results.
+        """
         return sorted({k[2] for k in self._results})
 
     def filter(

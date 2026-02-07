@@ -29,7 +29,12 @@ from tscf_eval.evaluator import (
 )
 
 from .results import BenchmarkResults, ExplainerResult
-from .selection import SelectionStrategy, select_instances
+from .selection import (
+    N_CONFIDENCE_BINS,
+    SelectionStrategy,
+    compute_confidence_bins,
+    select_instances,
+)
 
 if TYPE_CHECKING:
     from .config import DatasetConfig, ExplainerConfig, ModelConfig
@@ -43,6 +48,12 @@ try:
     _JOBLIB_AVAILABLE = True
 except ImportError:
     _JOBLIB_AVAILABLE = False
+    warnings.warn(
+        "joblib is not installed. Parallel benchmark execution is disabled. "
+        "Install joblib for parallel support: pip install joblib",
+        UserWarning,
+        stacklevel=2,
+    )
 
 try:
     from tqdm.auto import tqdm
@@ -50,6 +61,12 @@ try:
     _TQDM_AVAILABLE = True
 except ImportError:
     _TQDM_AVAILABLE = False
+    warnings.warn(
+        "tqdm is not installed. Benchmark progress bars are disabled. "
+        "Install tqdm for progress reporting: pip install tqdm",
+        UserWarning,
+        stacklevel=2,
+    )
 
 
 def _limit_numba_threads() -> None:
@@ -67,18 +84,19 @@ def _default_evaluator() -> Evaluator:
     return Evaluator(
         [
             Validity(),
-            Proximity(p=1),
-            Proximity(p=2),
-            Proximity(p=float("inf")),
+            Proximity(p=1, distance="lp"),
+            Proximity(p=2, distance="lp"),
+            Proximity(p=float("inf"), distance="lp"),
+            Proximity(distance="dtw"),
             Sparsity(),
             Plausibility(method="lof"),
             Plausibility(method="if"),
-            Plausibility(method="mp_ocsvm"),
-            Diversity(),
+            Plausibility(method="dtw_lof"),
+            Diversity(distance="dtw"),
             Contiguity(),
             Composition(),
             Confidence(),
-            Robustness(),
+            Robustness(distance="dtw"),
             Efficiency(),
         ]
     )
@@ -96,19 +114,53 @@ def _run_single_task(
 ) -> ExplainerResult:
     """Run a single (dataset, model, explainer) combination.
 
-    This function is designed to be called in parallel.
+    Generates counterfactuals for selected test instances, detects silent
+    failures (counterfactuals identical to originals), evaluates metrics on
+    successful instances, and computes per-confidence-quartile breakdowns.
+
+    Designed to be called in parallel via ``joblib``.
+
+    Parameters
+    ----------
+    dataset : DatasetConfig
+        Dataset containing train/test data.
+    model : ModelConfig
+        Fitted classifier model.
+    explainer_config : ExplainerConfig
+        Explainer class, parameters, and number of counterfactuals.
+    evaluator : Evaluator
+        Evaluator with configured metrics.
+    n_instances : int or None
+        Number of test instances to evaluate. ``None`` uses all.
+    instance_selection : SelectionStrategy
+        Strategy for selecting test instances.
+    random_state : int or None
+        Random seed for reproducible instance selection.
+    verbose : bool
+        Whether to print progress information.
+
+    Returns
+    -------
+    ExplainerResult
+        Results containing counterfactuals, metrics, and metadata.
     """
     # Limit numba threads to avoid contention
     _limit_numba_threads()
 
     # Select test instances
-    X_test, y_test = select_instances(
+    X_test, y_test, bin_indices = select_instances(
         dataset=dataset,
         model=model,
         n_instances=n_instances,
         strategy=instance_selection,
         random_state=random_state,
     )
+
+    # Fall back to computing bins on the selected subset when
+    # stratified selection did not provide original bin assignments
+    # (e.g. random strategy or no subsampling).
+    if bin_indices is None:
+        bin_indices = compute_confidence_bins(X_test, model)
 
     n_test = len(X_test)
     k = explainer_config.n_counterfactuals
@@ -222,6 +274,51 @@ def _run_single_task(
         metrics = evaluator.evaluate(X_orig, X_cf_eval, **eval_kwargs)
     else:
         metrics = {"_note": "No successful counterfactuals generated"}
+
+    # --- Per-confidence-quantile evaluation ---
+    if bin_indices is not None and np.any(success_mask):
+        for q in range(N_CONFIDENCE_BINS):
+            suffix = f"_q{q + 1}"
+
+            bin_mask_full = bin_indices == q
+            bin_success_mask = bin_mask_full & success_mask
+
+            n_bin_total = int(np.sum(bin_mask_full))
+            n_bin_success = int(np.sum(bin_success_mask))
+
+            metrics[f"_n_instances{suffix}"] = n_bin_total
+            metrics[f"_n_successful{suffix}"] = n_bin_success
+
+            if n_bin_success == 0:
+                continue
+
+            X_orig_q = X_test[bin_success_mask]
+            X_cf_q = X_cf[bin_success_mask]
+            y_cf_q = y_cf[bin_success_mask]
+            times_q = [generation_times[i] for i in range(n_test) if bin_success_mask[i]]
+
+            eval_kwargs_q: dict[str, Any] = {
+                "model": model.model,
+                "X_train": dataset.X_train,
+                "y": y_test[bin_success_mask] if y_test is not None else None,
+                "time_per_instance": times_q,
+            }
+
+            if k > 1:
+                X_cf_eval_q = X_cf_q[:, 0]
+                y_cf_eval_q = y_cf_q[:, 0]
+                eval_kwargs_q["_X_cf_all"] = X_cf_q
+            else:
+                X_cf_eval_q = X_cf_q
+                y_cf_eval_q = y_cf_q
+
+            eval_kwargs_q["y_cf"] = y_cf_eval_q
+
+            bin_metrics = evaluator.evaluate(X_orig_q, X_cf_eval_q, **eval_kwargs_q)
+
+            for key, value in bin_metrics.items():
+                if not key.startswith("_"):
+                    metrics[f"{key}{suffix}"] = value
 
     return ExplainerResult(
         explainer_name=explainer_config.name,

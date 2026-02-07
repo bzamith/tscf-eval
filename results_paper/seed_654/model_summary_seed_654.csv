@@ -1,0 +1,26 @@
+Model,Dataset,Test F1
+timecnn,Lightning7,62.23%
+timecnn,CBF,93.34%
+timecnn,Chinatown,89.65%
+timecnn,ECG200,79.26%
+timecnn,ArrowHead,63.83%
+tsf,Lightning7,71.39%
+tsf,CBF,99.00%
+tsf,Chinatown,97.49%
+tsf,ECG200,86.43%
+tsf,ArrowHead,71.61%
+rocket,Lightning7,77.88%
+rocket,CBF,100.00%
+rocket,Chinatown,97.84%
+rocket,ECG200,91.21%
+rocket,ArrowHead,80.54%
+rdst,Lightning7,79.92%
+rdst,CBF,99.34%
+rdst,Chinatown,97.14%
+rdst,ECG200,86.63%
+rdst,ArrowHead,85.20%
+tsfresh_lr,Lightning7,73.69%
+tsfresh_lr,CBF,97.68%
+tsfresh_lr,Chinatown,92.33%
+tsfresh_lr,ECG200,82.17%
+tsfresh_lr,ArrowHead,69.10%

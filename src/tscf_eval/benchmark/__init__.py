@@ -58,14 +58,16 @@ from .multi_criteria import (
     FriedmanResult,
     ParetoAnalyzer,
     WeightedScalarizer,
+    _is_maximize as is_maximize,
     format_latex_table,
     friedman_test,
 )
 from .results import BenchmarkResults, ExplainerResult
 from .runner import BenchmarkRunner
-from .selection import SelectionStrategy
+from .selection import N_CONFIDENCE_BINS, SelectionStrategy, compute_confidence_bins
 
 __all__ = [
+    "N_CONFIDENCE_BINS",
     "BenchmarkResults",
     "BenchmarkRunner",
     "DatasetConfig",
@@ -76,6 +78,8 @@ __all__ = [
     "ParetoAnalyzer",
     "SelectionStrategy",
     "WeightedScalarizer",
+    "compute_confidence_bins",
     "format_latex_table",
     "friedman_test",
+    "is_maximize",
 ]

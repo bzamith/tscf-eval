@@ -6,12 +6,18 @@ change to this time series would cause the classifier to predict a different cla
 
 Available Explainers
 --------------------
+CELS
+    Counterfactual explanations via learned saliency maps blending the
+    original with the nearest unlike neighbor (Li et al., 2023).
 COMTE
     Counterfactual Multivariate Time-series Explanations. Uses greedy channel
     substitution from distractor series (Ates et al., 2021).
 NativeGuide
     Instance-based counterfactual explanations using nearest-unlike-neighbor
     guidance with DTW barycenter averaging (Delaney et al., 2021).
+SETS
+    Shapelet-based counterfactual explanations using class-specific shapelet
+    manipulation with contiguous perturbations (Bahri et al., 2022).
 TSEvo
     Evolutionary counterfactual explanations using multi-objective optimization
     (NSGA-II) with three mutation strategies (Höllig et al., 2022).
@@ -30,7 +36,7 @@ Counterfactual
 
 Examples
 --------
->>> from tscf_eval.counterfactuals import COMTE, NativeGuide, TSEvo, Glacier, LatentCF
+>>> from tscf_eval.counterfactuals import CELS, COMTE, NativeGuide, TSEvo, Glacier, LatentCF
 >>> import numpy as np
 >>>
 >>> # Assume clf is a trained classifier and (X_train, y_train) is training data
@@ -58,15 +64,19 @@ from __future__ import annotations
 
 from . import utils
 from .base import Counterfactual
+from .cels import CELS
 from .comte import COMTE
 from .glacier import Glacier
 from .latent_cf import LatentCF
 from .native_guide import NativeGuide
+from .sets import SETS
 from .tsevo import TSEvo
 
 # Public API
 __all__: list[str] = [
+    "CELS",
     "COMTE",
+    "SETS",
     "Counterfactual",
     "Glacier",
     "LatentCF",

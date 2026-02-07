@@ -11,6 +11,7 @@ dtw_distance_vec_multich
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
+import warnings
 
 import numpy as np
 
@@ -59,6 +60,13 @@ def euclidean_cdist_flat(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     if SCIPY_AVAILABLE:
         cdist_fn = cast("Callable[..., np.ndarray]", cdist)
         return cdist_fn(A2, B2, metric="euclidean")
+    warnings.warn(
+        "scipy is not installed. euclidean_cdist_flat() is using a manual NumPy "
+        "fallback which may be slower for large arrays. "
+        "Install scipy for optimized computation: pip install scipy",
+        UserWarning,
+        stacklevel=2,
+    )
     diff = A2[:, None, :] - B2[None, :, :]
     result: np.ndarray = np.sqrt(np.sum(diff * diff, axis=2))
     return result
@@ -86,6 +94,13 @@ def dtw_distance_vec_multich(x: np.ndarray, B: np.ndarray) -> np.ndarray:
     computed after flattening the channels/time dimensions.
     """
     if not TSLEARN_AVAILABLE:
+        warnings.warn(
+            "tslearn is not installed. dtw_distance_vec_multich() is falling back "
+            "to Euclidean distance, which ignores temporal alignment. "
+            "Install tslearn for proper DTW distances: pip install tslearn",
+            UserWarning,
+            stacklevel=2,
+        )
         xb, _ = ensure_batch_shape(x)
         return euclidean_cdist_flat(xb, B).ravel()
 

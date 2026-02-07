@@ -30,6 +30,11 @@ def ensure_batch_shape(x: np.ndarray) -> tuple[np.ndarray, bool]:
     (possibly multivariate) to keep the wrapper safe for the common single-
     instance code paths used in explainers.
 
+    Parameters
+    ----------
+    x : np.ndarray
+        Time series with shape ``(T,)``, ``(C, T)``, or ``(N, C, T)``.
+
     Returns
     -------
     xb : np.ndarray

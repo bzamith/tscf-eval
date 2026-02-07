@@ -7,6 +7,7 @@ import pytest
 from sklearn.neighbors import KNeighborsClassifier
 
 from tscf_eval.benchmark import (
+    N_CONFIDENCE_BINS,
     BenchmarkResults,
     BenchmarkRunner,
     DatasetConfig,
@@ -697,3 +698,142 @@ class TestInstanceSelectionIntegration:
             result = results.get(dataset_config.name, model_config.name, "comte")
             assert result is not None
             assert result.n_instances == dataset_config.n_test
+
+
+# =============================================================================
+# Per-Quantile Stratified Metrics Tests
+# =============================================================================
+
+
+class TestPerQuantileMetrics:
+    """Tests for per-confidence-quantile metric stratification."""
+
+    def test_quantile_metrics_present(
+        self,
+        dataset_config: DatasetConfig,
+        model_config: ModelConfig,
+    ) -> None:
+        """Test that per-quantile metrics appear in the results dict."""
+        runner = BenchmarkRunner(
+            datasets=[dataset_config],
+            models=[model_config],
+            explainers=[ExplainerConfig("comte", COMTE, {"distance": "euclidean"})],
+            n_instances=8,
+            instance_selection="stratified_confidence",
+            verbose=False,
+        )
+
+        results = runner.run()
+        result = results.get(dataset_config.name, model_config.name, "comte")
+        assert result is not None
+
+        # Overall metrics should still be present
+        assert "validity_soft" in result.metrics
+
+        # Per-quantile keys should exist for bins with successful CFs
+        has_any_q = any(
+            f"validity_soft_q{q}" in result.metrics for q in range(1, N_CONFIDENCE_BINS + 1)
+        )
+        assert has_any_q, "Expected at least one per-quantile validity key"
+
+        # Metadata keys should always be present for every bin
+        for q in range(1, N_CONFIDENCE_BINS + 1):
+            assert f"_n_instances_q{q}" in result.metrics
+
+    def test_quantile_metrics_in_dataframe(
+        self,
+        dataset_config: DatasetConfig,
+        model_config: ModelConfig,
+    ) -> None:
+        """Test that per-quantile metrics appear as columns in to_dataframe()."""
+        runner = BenchmarkRunner(
+            datasets=[dataset_config],
+            models=[model_config],
+            explainers=[ExplainerConfig("comte", COMTE, {"distance": "euclidean"})],
+            n_instances=8,
+            instance_selection="stratified_confidence",
+            verbose=False,
+        )
+
+        results = runner.run()
+        df = results.to_dataframe()
+
+        # Per-quantile metric columns should appear
+        q_cols = [c for c in df.columns if c.endswith(("_q1", "_q2", "_q3", "_q4"))]
+        assert len(q_cols) > 0
+
+        # Underscore-prefixed metadata should NOT appear in DataFrame
+        assert "_n_instances_q1" not in df.columns
+
+    def test_quantile_metrics_with_random_selection(
+        self,
+        dataset_config: DatasetConfig,
+        model_config: ModelConfig,
+    ) -> None:
+        """Test that per-quantile metrics work with random selection too."""
+        runner = BenchmarkRunner(
+            datasets=[dataset_config],
+            models=[model_config],
+            explainers=[ExplainerConfig("comte", COMTE, {"distance": "euclidean"})],
+            n_instances=8,
+            instance_selection="random",
+            verbose=False,
+        )
+
+        results = runner.run()
+        result = results.get(dataset_config.name, model_config.name, "comte")
+        assert result is not None
+
+        # Per-quantile metadata should exist even with random selection
+        for q in range(1, N_CONFIDENCE_BINS + 1):
+            assert f"_n_instances_q{q}" in result.metrics
+
+    def test_quantile_bin_counts_sum_to_total(
+        self,
+        dataset_config: DatasetConfig,
+        model_config: ModelConfig,
+    ) -> None:
+        """Test that per-bin instance counts sum to total instances."""
+        runner = BenchmarkRunner(
+            datasets=[dataset_config],
+            models=[model_config],
+            explainers=[ExplainerConfig("comte", COMTE, {"distance": "euclidean"})],
+            n_instances=8,
+            instance_selection="stratified_confidence",
+            verbose=False,
+        )
+
+        results = runner.run()
+        result = results.get(dataset_config.name, model_config.name, "comte")
+        assert result is not None
+
+        total_from_bins = sum(
+            result.metrics[f"_n_instances_q{q}"] for q in range(1, N_CONFIDENCE_BINS + 1)
+        )
+        assert total_from_bins == result.n_instances
+
+    def test_quantile_metrics_json_roundtrip(
+        self,
+        dataset_config: DatasetConfig,
+        model_config: ModelConfig,
+    ) -> None:
+        """Test that per-quantile metrics survive to_dict/from_dict roundtrip."""
+        runner = BenchmarkRunner(
+            datasets=[dataset_config],
+            models=[model_config],
+            explainers=[ExplainerConfig("comte", COMTE, {"distance": "euclidean"})],
+            n_instances=8,
+            instance_selection="stratified_confidence",
+            verbose=False,
+        )
+
+        results = runner.run()
+        restored = BenchmarkResults.from_dict(results.to_dict())
+
+        result_orig = results.get(dataset_config.name, model_config.name, "comte")
+        result_rest = restored.get(dataset_config.name, model_config.name, "comte")
+        assert result_orig is not None and result_rest is not None
+
+        # All metric keys should survive the roundtrip
+        for key in result_orig.metrics:
+            assert key in result_rest.metrics

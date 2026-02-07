@@ -18,8 +18,7 @@ Algorithm Overview
 ------------------
 TSEvo generates counterfactuals through multi-objective evolutionary optimization:
 
-1. Initialize a population of candidate solutions derived from the reference set
-   (series predicted as the target class).
+1. Initialize a population of candidate solutions from the original instance.
 2. Evolve the population using NSGA-II with three mutation operators:
 
    - **authentic_opposing_information**: Replace temporal windows with segments
@@ -76,8 +75,9 @@ If not installed, a helpful error message will guide installation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal
+import warnings
 
 import numpy as np
 
@@ -123,9 +123,9 @@ class TSEvo(Counterfactual):
         A classifier with a probability estimator (``predict_proba`` or a
         compatible interface). The helper ``predict_proba_fn`` wraps model
         inference.
-    data : tuple (X_ref, y_ref)
-        Reference dataset used for mutation operations and population
-        initialization. Series predicted as the target class are used.
+    data : tuple (``X_ref``, ``y_ref``)
+        Reference dataset used for mutation operations. Series predicted as
+        the target class are used during evolution.
     transformer : {'authentic', 'frequency', 'gaussian', 'all'}, default 'authentic'
         Mutation strategy to use:
 
@@ -177,11 +177,14 @@ class TSEvo(Counterfactual):
     random_state: int | None = 0
     verbose: int = 0
 
-    # Internal state (not exposed as parameters)
-    _deap_initialized: bool = field(default=False, init=False, repr=False)
-    _ref_predictions: np.ndarray | None = field(default=None, init=False, repr=False)
-
     def __post_init__(self):
+        """Initialise probability wrapper, RNG, reference data, and label mapping.
+
+        Validates all hyperparameters and ensures the ``deap`` package is
+        available for evolutionary computation. Rounds ``population_size``
+        up to the nearest multiple of four as required by NSGA-II
+        tournament selection.
+        """
         if not DEAP_AVAILABLE:
             raise ImportError(
                 "TSEvo requires the 'deap' package for evolutionary computation. "
@@ -192,6 +195,12 @@ class TSEvo(Counterfactual):
         self.rng = np.random.default_rng(self.random_state)
         self.X_ref = np.asarray(self.data[0])
         self.y_ref = np.asarray(self.data[1]).ravel()
+
+        self._init_label_mapping(self.model, self.y_ref)
+
+        # Pre-compute reference set predictions (matches NativeGuide/CoMTE)
+        self._ref_probs = self.predict_proba(self.X_ref)
+        self._ref_yhat = np.argmax(self._ref_probs, axis=1)
 
         # Validate parameters
         if self.transformer not in ("authentic", "frequency", "gaussian", "all"):
@@ -251,153 +260,158 @@ class TSEvo(Counterfactual):
         xb, added = ensure_batch_shape(x)
         x1 = strip_batch(xb, added)
 
-        # Determine base prediction and target class
         base_probs = self.predict_proba(xb)[0]
-        base_label = int(np.argmax(base_probs)) if y_pred is None else int(y_pred)
+        base_idx = int(np.argmax(base_probs)) if y_pred is None else self._label_to_idx(y_pred)
+        target_idx = self._resolve_target_class(base_probs, base_idx, class_of_interest)
 
-        if class_of_interest is None:
-            probs_sorted = np.argsort(-base_probs)
-            class_of_interest = int(next(c for c in probs_sorted if c != base_label))
-
-        # Get reference set: series predicted as target class
-        reference_set = self._get_reference_set(class_of_interest)
+        # Step 1: Build reference set from series predicted as target class
+        reference_set = self._build_reference_set(target_idx, fallback_exclude=base_idx)
         if len(reference_set) == 0:
-            # Fallback: use all series not predicted as base_label
-            reference_set = self._get_reference_set_fallback(base_label)
+            return self._no_reference_set_fallback(x1, base_idx, target_idx)
 
-        if len(reference_set) == 0:
-            return (
-                x1,
-                base_label,
-                {
-                    "method": "tsevo",
-                    "note": "no reference set found; returning original",
-                    "transformer": self.transformer,
-                },
-            )
+        # Step 2: Evolve counterfactuals via NSGA-II
+        best, pareto_front = self._run_evolution(x1, base_idx, target_idx, reference_set)
 
-        # Run evolutionary optimization
-        best_individual, pareto_front, _logbook = self._evolve(
-            x1, base_label, class_of_interest, reference_set
-        )
-
-        # Extract best counterfactual
-        cf = np.array(best_individual).reshape(x1.shape)
+        # Step 3: Assemble result
+        cf = np.array(best).reshape(x1.shape)
         cf_probs = self.predict_proba(cf[None, ...])[0]
-        cf_label = int(np.argmax(cf_probs))
+        cf_idx = int(np.argmax(cf_probs))
+        objectives = self._evaluate_objectives(cf, x1, base_idx, target_idx, cf_probs)
 
-        # Compute final objectives for metadata
-        objectives = self._evaluate_objectives(cf, x1, base_label, class_of_interest, cf_probs)
-
-        meta: dict[str, Any] = {
-            "method": "tsevo",
-            "transformer": self.transformer,
-            "class_of_interest": class_of_interest,
-            "n_generations": self.n_generations,
-            "population_size": self.population_size,
-            "objectives": {
-                "output_distance": float(objectives[0]),
-                "input_distance": float(objectives[1]),
-                "sparsity": float(objectives[2]),
-            },
-            "pareto_front_size": len(pareto_front),
-            "validity": cf_label != base_label,
-        }
-
+        cf_label = self._idx_to_label(cf_idx)
+        meta = self._build_meta(target_idx, objectives, len(pareto_front), cf_idx != base_idx)
         return cf, cf_label, meta
 
-    def _get_ref_predictions(self) -> np.ndarray:
-        """Get cached predictions for reference set.
-
-        Computes predictions once and caches them for reuse across
-        multiple explain() calls.
-
-        Returns
-        -------
-        np.ndarray
-            Predicted class labels for all reference samples.
-        """
-        if self._ref_predictions is None:
-            probs = self.predict_proba(self.X_ref)
-            self._ref_predictions = np.argmax(probs, axis=1)
-        return self._ref_predictions
-
-    def _get_reference_set(self, target_class: int) -> np.ndarray:
-        """Get reference series predicted as target class.
-
-        Parameters
-        ----------
-        target_class : int
-            Target class to filter reference set by.
-
-        Returns
-        -------
-        np.ndarray
-            Subset of reference data predicted as target class.
-        """
-        yhat = self._get_ref_predictions()
-        mask = yhat == target_class
-        result: np.ndarray = self.X_ref[mask]
-        return result
-
-    def _get_reference_set_fallback(self, base_label: int) -> np.ndarray:
-        """Fallback: get any series not predicted as base class.
-
-        Parameters
-        ----------
-        base_label : int
-            Base class label to exclude.
-
-        Returns
-        -------
-        np.ndarray
-            Subset of reference data not predicted as base_label.
-        """
-        yhat = self._get_ref_predictions()
-        mask = yhat != base_label
-        result: np.ndarray = self.X_ref[mask]
-        return result
-
-    def _setup_deap(self, n_features: int):
-        """Initialize DEAP creator and toolbox for this problem.
-
-        Parameters
-        ----------
-        n_features : int
-            Total number of features (flattened time series length).
-        """
-        # Clean up any previous DEAP definitions
-        if hasattr(creator, "FitnessMin"):
-            del creator.FitnessMin
-        if hasattr(creator, "Individual"):
-            del creator.Individual
-
-        # 3 objectives: output_distance, input_distance, sparsity (all minimize)
-        # Use list as base type to avoid numpy array comparison issues in ParetoFront
-        creator.create("FitnessMin", base.Fitness, weights=(-1.0, -1.0, -1.0))
-        creator.create("Individual", list, fitness=creator.FitnessMin)
-
-        self._deap_initialized = True
-
-    def _evolve(
+    def _resolve_target_class(
         self,
-        x: np.ndarray,
-        base_label: int,
-        target_class: int,
-        reference_set: np.ndarray,
-    ) -> tuple[np.ndarray, list, Any]:
-        """Run the evolutionary optimization.
+        base_probs: np.ndarray,
+        base_idx: int,
+        class_of_interest: int | None,
+    ) -> int:
+        """Determine the target class index for counterfactual generation.
+
+        If ``class_of_interest`` is provided, it is converted to an internal
+        index. Otherwise, the highest-probability class other than
+        ``base_idx`` is selected.
+
+        Parameters
+        ----------
+        base_probs : np.ndarray
+            Probability vector for the query instance.
+        base_idx : int
+            Probability column index of the base (original) class.
+        class_of_interest : int or None
+            User-specified target class label, or ``None`` for automatic
+            selection.
+
+        Returns
+        -------
+        int
+            Probability column index for the target class.
+        """
+        if class_of_interest is not None:
+            return self._label_to_idx(class_of_interest)
+        probs_sorted = np.argsort(-base_probs)
+        return int(next(c for c in probs_sorted if c != base_idx))
+
+    def _build_reference_set(self, target_idx: int, fallback_exclude: int) -> np.ndarray:
+        """Get reference series predicted as target class, with fallback.
+
+        Primary: series predicted as ``target_idx``.
+        Fallback: any series NOT predicted as ``fallback_exclude``.
+
+        Parameters
+        ----------
+        target_idx : int
+            Target class index to filter reference set by.
+        fallback_exclude : int
+            Base class index to exclude in the fallback.
+
+        Returns
+        -------
+        np.ndarray
+            Subset of reference data (may be empty if no candidates exist).
+        """
+        mask = self._ref_yhat == target_idx
+        if np.any(mask):
+            result: np.ndarray = self.X_ref[mask]
+            return result
+        mask = self._ref_yhat != fallback_exclude
+        result = self.X_ref[mask]
+        return result
+
+    def _no_reference_set_fallback(
+        self, x: np.ndarray, base_idx: int, target_idx: int
+    ) -> tuple[np.ndarray, int, dict[str, Any]]:
+        """Return the original instance unchanged when no reference set exists.
+
+        Emits a warning and returns a metadata dict with
+        ``validity=False`` and ``failure_reason='no_reference_set'``.
 
         Parameters
         ----------
         x : np.ndarray
             Original time series of shape ``(T,)`` or ``(C, T)``.
-        base_label : int
-            Original predicted class label.
-        target_class : int
-            Target class for counterfactual.
+        base_idx : int
+            Probability column index of the base class.
+        target_idx : int
+            Probability column index of the target class.
+
+        Returns
+        -------
+        cf : np.ndarray
+            The original ``x`` (unchanged).
+        cf_label : int
+            Base class label.
+        meta : dict
+            Metadata dictionary flagged as invalid.
+
+        Warns
+        -----
+        UserWarning
+            When no reference series are found for the target class.
+        """
+        warnings.warn(
+            f"TSEvo: No reference series found for target class "
+            f"{self._idx_to_label(target_idx)}. "
+            f"The classifier predicts no reference samples as the target class "
+            f"(base class={self._idx_to_label(base_idx)}). The original instance "
+            f"is returned unchanged.",
+            UserWarning,
+            stacklevel=3,
+        )
+        return (
+            x,
+            self._idx_to_label(base_idx),
+            {
+                "method": "tsevo",
+                "transformer": self.transformer,
+                "class_of_interest": self._idx_to_label(target_idx),
+                "validity": False,
+                "failure_reason": "no_reference_set",
+                "note": "no reference set found; returning original unchanged",
+            },
+        )
+
+    def _run_evolution(
+        self,
+        x: np.ndarray,
+        base_idx: int,
+        target_idx: int,
+        reference_set: np.ndarray,
+    ) -> tuple[np.ndarray, list]:
+        """Run NSGA-II evolutionary optimization.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Original time series of shape ``(T,)`` or ``(C, T)``.
+        base_idx : int
+            Original predicted class index.
+        target_idx : int
+            Target class index for counterfactual.
         reference_set : np.ndarray
-            Reference series to sample from for mutations.
+            Reference series used for mutation operators.
 
         Returns
         -------
@@ -405,57 +419,21 @@ class TSEvo(Counterfactual):
             Best counterfactual found.
         pareto_front : list
             All Pareto-optimal individuals.
-        logbook : deap.tools.Logbook
-            Evolution statistics.
         """
-        n_features = x.size
-        self._setup_deap(n_features)
+        # Step A: Register DEAP types and build toolbox
+        self._register_deap_types(n_features=x.size)
+        toolbox = self._build_toolbox(x, reference_set)
 
-        toolbox = base.Toolbox()
-
-        # Individual initialization: sample from reference set
-        def init_individual():
-            idx = self.rng.integers(0, len(reference_set))
-            # Use list for DEAP compatibility, convert to numpy for operations
-            ind = creator.Individual(reference_set[idx].flatten().tolist())
-            # Attach metadata for mutation operator
-            ind.window_size = self.rng.choice(self.window_sizes)
-            ind.transformer_type = self._select_transformer()
-            return ind
-
-        toolbox.register("individual", init_individual)
-        toolbox.register("population", tools.initRepeat, list, toolbox.individual)
-
-        # Genetic operators
-        toolbox.register(
-            "mate",
-            self._crossover,
-            x_shape=x.shape,
-        )
-        toolbox.register(
-            "mutate",
-            self._mutate,
-            x_original=x,
-            reference_set=reference_set,
-        )
-        toolbox.register("select", tools.selNSGA2)
-
-        # Initialize population
+        # Step B: Create and evaluate initial population
         pop = toolbox.population(n=self.population_size)
-
-        # Evaluate initial population using batch prediction
-        fitnesses = self._batch_evaluate(pop, x, base_label, target_class)
+        fitnesses = self._evaluate_population(pop, x, base_idx, target_idx)
         for ind, fit in zip(pop, fitnesses, strict=True):
             ind.fitness.values = fit
-
-        # Assign crowding distance for initial population
         pop = toolbox.select(pop, len(pop))
 
-        # Hall of Fame for Pareto front
         hof = tools.ParetoFront()
         hof.update(pop)
 
-        # Statistics
         stats = tools.Statistics(lambda ind: ind.fitness.values)
         stats.register("min", np.min, axis=0)
         stats.register("avg", np.mean, axis=0)
@@ -463,16 +441,14 @@ class TSEvo(Counterfactual):
 
         logbook = tools.Logbook()
         logbook.header = ["gen", "nevals", *stats.fields]
-
         record = stats.compile(pop)
         logbook.record(gen=0, nevals=len(pop), **record)
 
         if self.verbose > 0:
             print(logbook.stream)
 
-        # Main evolution loop (NSGA-II style)
+        # Step C: Main evolution loop (NSGA-II)
         for gen in range(1, self.n_generations + 1):
-            # Select offspring using tournament selection with crowding distance
             offspring = tools.selTournamentDCD(pop, len(pop))
             offspring = [toolbox.clone(ind) for ind in offspring]
 
@@ -489,14 +465,14 @@ class TSEvo(Counterfactual):
                     toolbox.mutate(mutant)
                     del mutant.fitness.values
 
-            # Evaluate individuals with invalid fitness using batch prediction
+            # Evaluate individuals with invalidated fitness
             invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
             if invalid_ind:
-                fitnesses = self._batch_evaluate(invalid_ind, x, base_label, target_class)
+                fitnesses = self._evaluate_population(invalid_ind, x, base_idx, target_idx)
                 for ind, fit in zip(invalid_ind, fitnesses, strict=True):
                     ind.fitness.values = fit
 
-            # Select next generation using NSGA-II (computes crowding distance)
+            # Select next generation (NSGA-II computes crowding distance)
             pop = toolbox.select(pop + offspring, self.population_size)
             hof.update(pop)
 
@@ -506,23 +482,85 @@ class TSEvo(Counterfactual):
             if self.verbose > 0:
                 print(logbook.stream)
 
-        # Select best individual from Pareto front
-        # Prioritize validity (low output_distance), then proximity
-        best = self._select_best_from_pareto(hof, x, base_label, target_class)
+        # Step D: Pick best from Pareto front
+        best = self._pick_best_from_pareto(hof, x, base_idx, target_idx)
+        return best, list(hof)
 
-        return best, list(hof), logbook
+    def _register_deap_types(self, n_features: int) -> None:
+        """Register DEAP creator types (FitnessMin, Individual) for this problem.
 
-    def _batch_evaluate(
+        Parameters
+        ----------
+        n_features : int
+            Total number of features (flattened time series length).
+        """
+        if hasattr(creator, "FitnessMin"):
+            del creator.FitnessMin
+        if hasattr(creator, "Individual"):
+            del creator.Individual
+
+        # 3 objectives: output_distance, input_distance, sparsity (all minimize)
+        creator.create("FitnessMin", base.Fitness, weights=(-1.0, -1.0, -1.0))
+        creator.create("Individual", list, fitness=creator.FitnessMin)
+
+    def _build_toolbox(
+        self,
+        x: np.ndarray,
+        reference_set: np.ndarray,
+    ) -> base.Toolbox:
+        """Build a DEAP toolbox with individual factory and genetic operators.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Original time series used for population initialisation and
+            crossover/mutation shape info.
+        reference_set : np.ndarray
+            Reference series used for mutation operators.
+
+        Returns
+        -------
+        base.Toolbox
+            Fully configured DEAP toolbox.
+        """
+        toolbox = base.Toolbox()
+
+        x_flat = x.flatten().tolist()
+
+        def init_individual():
+            """Create one DEAP individual from the original instance.
+
+            Following the original TSEvo paper, each individual in the
+            initial population is a copy of the query instance ``x``.
+            Diversity is introduced through mutation operators, not
+            through population initialisation.
+
+            Returns
+            -------
+            creator.Individual
+                Flattened original series wrapped as a DEAP individual
+                with ``window_size`` and ``transformer_type`` attributes.
+            """
+            ind = creator.Individual(x_flat)
+            ind.window_size = self.rng.choice(self.window_sizes)
+            ind.transformer_type = self._choose_mutation_strategy()
+            return ind
+
+        toolbox.register("individual", init_individual)
+        toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+        toolbox.register("mate", self._crossover_windows, x_shape=x.shape)
+        toolbox.register("mutate", self._apply_mutation, x_original=x, reference_set=reference_set)
+        toolbox.register("select", tools.selNSGA2)
+        return toolbox
+
+    def _evaluate_population(
         self,
         individuals: list,
         x_original: np.ndarray,
-        base_label: int,
-        target_class: int,
+        base_idx: int,
+        target_idx: int,
     ) -> list[tuple[float, float, float]]:
-        """Evaluate multiple individuals using a single batch prediction.
-
-        This is significantly faster than evaluating individuals one-by-one,
-        especially for classifiers with high per-prediction overhead.
+        """Evaluate a batch of individuals using a single batch prediction.
 
         Parameters
         ----------
@@ -530,32 +568,26 @@ class TSEvo(Counterfactual):
             List of DEAP individuals to evaluate.
         x_original : np.ndarray
             Original time series.
-        base_label : int
-            Original predicted class.
-        target_class : int
-            Target class for counterfactual.
+        base_idx : int
+            Original predicted class index.
+        target_idx : int
+            Target class index for counterfactual.
 
         Returns
         -------
         list of tuple
-            List of (output_distance, input_distance, sparsity) for each individual.
+            List of (output_distance, input_distance, sparsity) per individual.
         """
         if not individuals:
             return []
 
-        # Stack all individuals into a batch
         cf_batch = np.array([np.array(ind).reshape(x_original.shape) for ind in individuals])
-
-        # Single batch prediction call
         probs_batch = self.predict_proba(cf_batch)
 
-        # Compute objectives for each individual
         results = []
-        for i, _ind in enumerate(individuals):
-            cf = cf_batch[i]
-            cf_probs = probs_batch[i]
+        for i in range(len(individuals)):
             objectives = self._evaluate_objectives(
-                cf, x_original, base_label, target_class, cf_probs
+                cf_batch[i], x_original, base_idx, target_idx, probs_batch[i]
             )
             results.append(objectives)
 
@@ -565,11 +597,11 @@ class TSEvo(Counterfactual):
         self,
         cf: np.ndarray,
         x_original: np.ndarray,
-        base_label: int,
-        target_class: int,
+        base_idx: int,
+        target_idx: int,
         cf_probs: np.ndarray,
     ) -> tuple[float, float, float]:
-        """Compute the three objective values.
+        """Compute the three fitness objectives.
 
         Parameters
         ----------
@@ -577,10 +609,10 @@ class TSEvo(Counterfactual):
             Candidate counterfactual.
         x_original : np.ndarray
             Original time series.
-        base_label : int
-            Original predicted class.
-        target_class : int
-            Target class for counterfactual.
+        base_idx : int
+            Original predicted class index.
+        target_idx : int
+            Target class index for counterfactual.
         cf_probs : np.ndarray
             Model probability output for cf.
 
@@ -589,49 +621,90 @@ class TSEvo(Counterfactual):
         tuple of float
             (output_distance, input_distance, sparsity)
         """
-        # Objective 1: Output distance
-        # If still predicting base class, penalize heavily
-        pred_label = int(np.argmax(cf_probs))
-        if pred_label == base_label:
-            output_dist = 1.0 - cf_probs[target_class]
+        # Objective 1: Output distance — penalize if still predicting base class
+        pred_idx = int(np.argmax(cf_probs))
+        if pred_idx == base_idx:
+            output_dist = 1.0 - cf_probs[target_idx]
         else:
-            # Already flipped, minimize further
-            output_dist = max(0.0, 0.5 - cf_probs[target_class])
+            output_dist = max(0.0, 0.5 - cf_probs[target_idx])
 
         # Objective 2: Input distance (normalized L1)
         diff = np.abs(cf.flatten() - x_original.flatten())
         input_dist = float(np.mean(diff))
 
         # Objective 3: Sparsity (proportion of changed features)
-        # Use tolerance-based comparison to avoid false positives from
-        # floating-point rounding (e.g., after inverse FFT in frequency mutation)
+        # Tolerance-based to avoid false positives from floating-point rounding
         n_changed = np.count_nonzero(~np.isclose(cf.flatten(), x_original.flatten(), atol=1e-8))
         sparsity = n_changed / cf.size
 
         return (output_dist, input_dist, sparsity)
 
-    def _select_transformer(self) -> str:
-        """Select mutation transformer type based on settings.
+    def _pick_best_from_pareto(
+        self,
+        pareto_front: list,
+        x_original: np.ndarray,
+        base_idx: int,
+        target_idx: int,
+    ) -> np.ndarray:
+        """Pick the best individual from the Pareto front.
+
+        Prioritizes valid counterfactuals (prediction changed), ranked by
+        proximity then target probability. Falls back to the individual
+        closest to flipping if none are valid.
+
+        Parameters
+        ----------
+        pareto_front : list
+            Pareto-optimal individuals.
+        x_original : np.ndarray
+            Original time series.
+        base_idx : int
+            Original predicted class index.
+        target_idx : int
+            Target class index for counterfactual.
 
         Returns
         -------
-        str
-            Selected transformer type.
+        np.ndarray
+            Best individual from Pareto front.
         """
-        if self.transformer == "all":
-            choice: str = self.rng.choice(["authentic", "frequency", "gaussian"])
-            return choice
-        return self.transformer
+        if len(pareto_front) == 0:
+            return x_original.flatten()
 
-    def _crossover(
+        # Batch predict all Pareto front individuals
+        cf_batch = np.array([np.array(ind).reshape(x_original.shape) for ind in pareto_front])
+        probs_batch = self.predict_proba(cf_batch)
+        pred_labels = np.argmax(probs_batch, axis=1)
+
+        # Prefer valid counterfactuals, ranked by proximity then target prob
+        valid_individuals = []
+        for i, ind in enumerate(pareto_front):
+            if pred_labels[i] != base_idx:
+                proximity = float(np.mean(np.abs(cf_batch[i].flatten() - x_original.flatten())))
+                valid_individuals.append((ind, proximity, probs_batch[i, target_idx]))
+
+        if valid_individuals:
+            valid_individuals.sort(key=lambda v: (v[1], -v[2]))
+            return np.array(valid_individuals[0][0])
+
+        # No valid counterfactual: return the one closest to flipping
+        best_ind = None
+        best_output_dist = float("inf")
+        for ind in pareto_front:
+            output_dist = ind.fitness.values[0]
+            if output_dist < best_output_dist:
+                best_output_dist = output_dist
+                best_ind = ind
+
+        return np.array(best_ind) if best_ind is not None else x_original.flatten()
+
+    def _crossover_windows(
         self,
         ind1: list,
         ind2: list,
         x_shape: tuple,
     ) -> tuple[list, list]:
-        """Perform crossover between two individuals.
-
-        Uses window-based uniform crossover respecting temporal structure.
+        """Window-based uniform crossover respecting temporal structure.
 
         Parameters
         ----------
@@ -650,7 +723,6 @@ class TSEvo(Counterfactual):
         window_size = getattr(ind1, "window_size", 10)
         T = x_shape[-1] if len(x_shape) > 1 else x_shape[0]
 
-        # Create window indices
         n_windows = max(1, T // window_size)
 
         for w in range(n_windows):
@@ -659,13 +731,11 @@ class TSEvo(Counterfactual):
                 end = min(start + window_size, T)
 
                 if len(x_shape) == 1:
-                    # Univariate: swap window segments
                     ind1[start:end], ind2[start:end] = (
                         list(ind2[start:end]),
                         list(ind1[start:end]),
                     )
                 else:
-                    # Multivariate: swap across all channels
                     C = x_shape[0]
                     for c in range(C):
                         c_start = c * T + start
@@ -677,57 +747,65 @@ class TSEvo(Counterfactual):
 
         return ind1, ind2
 
-    def _mutate(
+    def _apply_mutation(
         self,
         individual: list,
         x_original: np.ndarray,
         reference_set: np.ndarray,
     ) -> tuple[list]:
-        """Apply mutation based on transformer type.
+        """Dispatch mutation based on the individual's assigned strategy.
 
         Parameters
         ----------
         individual : list
             Individual to mutate (modified in-place).
         x_original : np.ndarray
-            Original time series for reference.
+            Original time series for shape reference.
         reference_set : np.ndarray
-            Reference set for authentic mutation.
+            Reference set for mutation operators.
 
         Returns
         -------
         tuple
             (individual,) as required by DEAP.
         """
-        transformer_type = getattr(individual, "transformer_type", "authentic")
+        strategy = getattr(individual, "transformer_type", "authentic")
 
-        if transformer_type == "authentic":
-            self._mutate_authentic(individual, x_original, reference_set)
-        elif transformer_type == "frequency":
-            self._mutate_frequency(individual, x_original, reference_set)
-        elif transformer_type == "gaussian":
-            self._mutate_gaussian(individual, reference_set)
+        if strategy == "authentic":
+            self._mutate_by_window_replacement(individual, x_original, reference_set)
+        elif strategy == "frequency":
+            self._mutate_by_frequency_band(individual, x_original, reference_set)
+        elif strategy == "gaussian":
+            self._mutate_by_gaussian_noise(individual, reference_set)
 
-        # Occasionally change the transformer type
+        # Occasionally change strategy or window size
         if self.transformer == "all" and self.rng.random() < 0.1:
-            individual.transformer_type = self._select_transformer()  # type: ignore[attr-defined]
-
-        # Occasionally change window size
+            individual.transformer_type = self._choose_mutation_strategy()  # type: ignore[attr-defined]
         if self.rng.random() < 0.1:
             individual.window_size = self.rng.choice(self.window_sizes)  # type: ignore[attr-defined]
 
         return (individual,)
 
-    def _mutate_authentic(
+    def _choose_mutation_strategy(self) -> str:
+        """Choose which mutation strategy to assign to an individual.
+
+        Returns
+        -------
+        str
+            Selected mutation strategy name.
+        """
+        if self.transformer == "all":
+            choice: str = self.rng.choice(["authentic", "frequency", "gaussian"])
+            return choice
+        return self.transformer
+
+    def _mutate_by_window_replacement(
         self,
         individual: list,
         x_original: np.ndarray,
         reference_set: np.ndarray,
     ) -> None:
-        """Authentic opposing information mutation.
-
-        Replaces a temporal window with the corresponding segment from a
-        reference series. This preserves realistic temporal patterns.
+        """Replace a temporal window with the corresponding segment from a reference series.
 
         Parameters
         ----------
@@ -738,14 +816,12 @@ class TSEvo(Counterfactual):
         reference_set : np.ndarray
             Reference series to sample from.
         """
-        # Select random reference series
         ref_idx = self.rng.integers(0, len(reference_set))
         ref_series = reference_set[ref_idx].flatten().tolist()
 
         window_size = getattr(individual, "window_size", 10)
         T = x_original.shape[-1] if x_original.ndim > 1 else x_original.shape[0]
 
-        # Select random window position
         if window_size >= T:
             start = 0
             end = T
@@ -754,10 +830,8 @@ class TSEvo(Counterfactual):
             end = start + window_size
 
         if x_original.ndim == 1:
-            # Univariate
             individual[start:end] = ref_series[start:end]
         else:
-            # Multivariate: mutate random channel
             C = x_original.shape[0]
             channel = self.rng.integers(0, C)
             c_start = channel * T + start
@@ -766,16 +840,13 @@ class TSEvo(Counterfactual):
             ref_c_end = channel * T + end
             individual[c_start:c_end] = ref_series[ref_c_start:ref_c_end]
 
-    def _mutate_frequency(
+    def _mutate_by_frequency_band(
         self,
         individual: list,
         x_original: np.ndarray,
         reference_set: np.ndarray,
     ) -> None:
-        """Frequency band mapping mutation.
-
-        Replaces frequency bands using FFT transformation, capturing
-        frequency-domain characteristics from reference series.
+        """Replace frequency bands via FFT from a reference series.
 
         Parameters
         ----------
@@ -786,36 +857,33 @@ class TSEvo(Counterfactual):
         reference_set : np.ndarray
             Reference series for frequency content.
         """
-        # Select random reference series
         ref_idx = self.rng.integers(0, len(reference_set))
         ref_series = reference_set[ref_idx].flatten()
 
         T = x_original.shape[-1] if x_original.ndim > 1 else x_original.shape[0]
 
         if x_original.ndim == 1:
-            # Univariate FFT mutation - convert to numpy for FFT
-            result = self._fft_band_replace(np.array(individual[:T]), ref_series[:T], T)
+            result = self._replace_fft_band(np.array(individual[:T]), ref_series[:T], T)
             individual[:T] = result.tolist()
         else:
-            # Multivariate: mutate random channel
             C = x_original.shape[0]
             channel = self.rng.integers(0, C)
             c_start = channel * T
             c_end = (channel + 1) * T
-            result = self._fft_band_replace(
+            result = self._replace_fft_band(
                 np.array(individual[c_start:c_end]),
                 ref_series[c_start:c_end],
                 T,
             )
             individual[c_start:c_end] = result.tolist()
 
-    def _fft_band_replace(
+    def _replace_fft_band(
         self,
         signal: np.ndarray,
         reference: np.ndarray,
         T: int,
     ) -> np.ndarray:
-        """Replace a frequency band from reference signal.
+        """Replace a random frequency band in signal with content from reference.
 
         Parameters
         ----------
@@ -831,14 +899,10 @@ class TSEvo(Counterfactual):
         np.ndarray
             Modified signal.
         """
-        # Compute FFT
         fft_signal = np.fft.rfft(signal)
         fft_reference = np.fft.rfft(reference)
 
         n_freqs = len(fft_signal)
-
-        # Define frequency bands (quadratic scaling as in original paper)
-        # Band widths increase quadratically with frequency
         n_bands = min(5, n_freqs)
         band_edges = np.linspace(0, n_freqs, n_bands + 1, dtype=int)
 
@@ -847,101 +911,74 @@ class TSEvo(Counterfactual):
             band_idx = self.rng.integers(1, n_bands)
             start = band_edges[band_idx]
             end = band_edges[band_idx + 1]
-
-            # Replace band
             fft_signal[start:end] = fft_reference[start:end]
 
-        # Inverse FFT
         result = np.fft.irfft(fft_signal, n=T)
         return result
 
-    def _mutate_gaussian(
+    def _mutate_by_gaussian_noise(
         self,
         individual: list,
         reference_set: np.ndarray,
     ) -> None:
-        """Gaussian perturbation based on reference set statistics.
-
-        Applies point-wise Gaussian noise scaled by the reference set's
-        mean and standard deviation.
+        """Apply point-wise Gaussian perturbation scaled by reference statistics.
 
         Parameters
         ----------
         individual : list
             Flattened individual to mutate in-place.
         reference_set : np.ndarray
-            Reference set for computing statistics.
+            Reference set for computing mean and std.
         """
-        # Compute reference statistics
         ref_flat = reference_set.reshape(len(reference_set), -1)
         means = ref_flat.mean(axis=0)
-        stds = ref_flat.std(axis=0) + 1e-8  # Avoid division by zero
+        stds = ref_flat.std(axis=0) + 1e-8
 
-        # Per-gene mutation probability
         indpb = 0.1
-
         for i in range(len(individual)):
             if self.rng.random() < indpb:
                 individual[i] = float(self.rng.normal(means[i % len(means)], stds[i % len(stds)]))
 
-    def _select_best_from_pareto(
+    def _build_meta(
         self,
-        pareto_front: list,
-        x_original: np.ndarray,
-        base_label: int,
-        target_class: int,
-    ) -> np.ndarray:
-        """Select the best individual from the Pareto front.
-
-        Prioritizes validity (prediction changed), then proximity.
-        Uses batch prediction for efficiency.
+        target_idx: int,
+        objectives: tuple[float, float, float],
+        pareto_front_size: int,
+        validity: bool,
+    ) -> dict[str, Any]:
+        """Build the metadata dictionary for an explanation result.
 
         Parameters
         ----------
-        pareto_front : list
-            Pareto-optimal individuals.
-        x_original : np.ndarray
-            Original time series.
-        base_label : int
-            Original predicted class.
-        target_class : int
-            Target class for counterfactual.
+        target_idx : int
+            Probability column index of the target class.
+        objectives : tuple of float
+            Final objective values ``(output_distance, input_distance,
+            sparsity)`` for the selected counterfactual.
+        pareto_front_size : int
+            Number of individuals in the final Pareto front.
+        validity : bool
+            Whether the counterfactual's predicted class differs from
+            the original.
 
         Returns
         -------
-        np.ndarray
-            Best individual from Pareto front.
+        dict[str, Any]
+            Metadata dictionary with keys ``method``, ``transformer``,
+            ``class_of_interest``, ``n_generations``, ``population_size``,
+            ``objectives``, ``pareto_front_size``, and ``validity``.
         """
-        if len(pareto_front) == 0:
-            # Should not happen, but fallback
-            return x_original.flatten()
-
-        # Batch predict all Pareto front individuals at once
-        cf_batch = np.array([np.array(ind).reshape(x_original.shape) for ind in pareto_front])
-        probs_batch = self.predict_proba(cf_batch)
-        pred_labels = np.argmax(probs_batch, axis=1)
-
-        # Find valid counterfactuals (prediction changed)
-        valid_individuals = []
-        for i, ind in enumerate(pareto_front):
-            if pred_labels[i] != base_label:
-                cf = cf_batch[i]
-                # Compute proximity for ranking
-                proximity = float(np.mean(np.abs(cf.flatten() - x_original.flatten())))
-                valid_individuals.append((ind, proximity, probs_batch[i, target_class]))
-
-        if valid_individuals:
-            # Sort by proximity (ascending), then by target probability (descending)
-            valid_individuals.sort(key=lambda x: (x[1], -x[2]))
-            return np.array(valid_individuals[0][0])
-
-        # No valid counterfactual found: return the one closest to flipping
-        best_ind = None
-        best_output_dist = float("inf")
-        for ind in pareto_front:
-            output_dist = ind.fitness.values[0]
-            if output_dist < best_output_dist:
-                best_output_dist = output_dist
-                best_ind = ind
-
-        return np.array(best_ind) if best_ind is not None else x_original.flatten()
+        return {
+            "method": "tsevo",
+            "transformer": self.transformer,
+            "class_of_interest": self._idx_to_label(target_idx),
+            "n_generations": self.n_generations,
+            "population_size": self.population_size,
+            "objectives": {
+                "output_distance": float(objectives[0]),
+                "input_distance": float(objectives[1]),
+                "sparsity": float(objectives[2]),
+            },
+            "pareto_front_size": pareto_front_size,
+            "validity": validity,
+        }
