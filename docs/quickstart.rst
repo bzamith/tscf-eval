@@ -4,6 +4,47 @@ Quick Start Guide
 This guide will help you get started with tscf-eval for evaluating
 counterfactual explanations for time series classification.
 
+Loading Data
+------------
+
+tscf-eval provides utilities for loading time series data.
+
+From the UCR Archive
+~~~~~~~~~~~~~~~~~~~~
+
+The easiest way to get started is using the UCR Time Series Archive:
+
+.. code-block:: python
+
+   from tscf_eval import UCRLoader
+
+   loader = UCRLoader("ItalyPowerDemand")
+   train_data = loader.load("train")
+   test_data = loader.load("test")
+
+   print(f"Train: {train_data.X.shape}, Test: {test_data.X.shape}")
+   print(train_data.describe())
+
+From NumPy Arrays
+~~~~~~~~~~~~~~~~~
+
+You can also create data containers from your own arrays:
+
+.. code-block:: python
+
+   from tscf_eval import TSCData
+   import numpy as np
+
+   X = np.random.randn(100, 50)  # 100 instances, 50 time points
+   y = np.array([0] * 50 + [1] * 50)
+
+   data = TSCData.from_arrays(
+       name="my_dataset",
+       split="train",
+       X=X,  # Shape: (n, T) or (n, C, T)
+       y=y,  # Shape: (n,)
+   )
+
 Basic Usage
 -----------
 
@@ -15,21 +56,35 @@ using the :class:`~tscf_eval.Evaluator` class:
 
 .. code-block:: python
 
-   from tscf_eval import Evaluator, Validity, Proximity, Sparsity
-   import numpy as np
+   from sklearn.neighbors import KNeighborsClassifier
+   from tscf_eval import (
+       Evaluator, Validity, Proximity, Sparsity,
+       UCRLoader, NativeGuide,
+   )
 
-   # Your original instances and counterfactuals
-   X = np.random.randn(100, 50)  # 100 instances, 50 time points
-   X_cf = X + np.random.randn(100, 50) * 0.1
+   # Load data
+   loader = UCRLoader("ItalyPowerDemand")
+   train, test = loader.load("train"), loader.load("test")
 
-   # Labels (original and counterfactual)
-   y = np.zeros(100)
-   y_cf = np.ones(100)
+   # Train classifier
+   clf = KNeighborsClassifier(n_neighbors=3)
+   clf.fit(train.X, train.y)
+
+   # Generate counterfactuals using NativeGuide
+   explainer = NativeGuide(clf, (train.X, train.y), method="blend")
+   X, X_cf, y, y_cf = [], [], [], []
+   for x in test.X[:10]:
+       cf, cf_label, _ = explainer.explain(x)
+       X.append(x)
+       X_cf.append(cf)
+       y.append(clf.predict(x.reshape(1, -1))[0])
+       y_cf.append(cf_label)
 
    # Create evaluator with desired metrics
    evaluator = Evaluator([
        Validity(),
        Proximity(p=2, distance="lp"),
+       Proximity(distance="dtw"),  # DTW-based proximity
        Sparsity(),
    ])
 
@@ -37,8 +92,9 @@ using the :class:`~tscf_eval.Evaluator` class:
    results = evaluator.evaluate(X, X_cf, y=y, y_cf=y_cf)
 
    # Access results
-   print(f"Validity: {results['validity']:.2f}")
+   print(f"Validity: {results['validity_soft']:.2f}")
    print(f"Proximity (L2): {results['proximity_l2']:.2f}")
+   print(f"Proximity (DTW): {results['proximity_dtw']:.2f}")
    print(f"Sparsity: {results['sparsity']:.2f}")
 
 Using a Classifier
@@ -50,13 +106,35 @@ classifier instead of labels:
 .. code-block:: python
 
    from sklearn.neighbors import KNeighborsClassifier
+   from tscf_eval import (
+       Evaluator, Validity, Proximity, Sparsity,
+       UCRLoader, COMTE,
+   )
+
+   # Load data
+   loader = UCRLoader("ItalyPowerDemand")
+   train, test = loader.load("train"), loader.load("test")
 
    # Train a classifier
    clf = KNeighborsClassifier(n_neighbors=3)
-   clf.fit(X_train, y_train)
+   clf.fit(train.X, train.y)
 
-   # Evaluate using the classifier
-   results = evaluator.evaluate(X_test, X_cf, model=clf)
+   # Generate counterfactuals using COMTE
+   explainer = COMTE(clf, (train.X, train.y), distance="dtw")
+   X, X_cf = [], []
+   for x in test.X[:10]:
+       cf, _, _ = explainer.explain(x)
+       X.append(x)
+       X_cf.append(cf)
+
+   # Evaluate using the classifier (labels inferred from model)
+   evaluator = Evaluator([
+       Validity(),
+       Proximity(p=2, distance="lp"),
+       Proximity(distance="dtw"),
+       Sparsity(),
+   ])
+   results = evaluator.evaluate(X, X_cf, model=clf)
 
 Some metrics require additional inputs:
 
@@ -109,38 +187,6 @@ tscf-eval provides 11 metric classes organized into six quality dimensions:
    * - Efficiency
      - Mean time per instance
      - seconds
-
-Loading Data
-------------
-
-tscf-eval provides utilities for loading time series data:
-
-From NumPy Arrays
-~~~~~~~~~~~~~~~~~
-
-.. code-block:: python
-
-   from tscf_eval import TSCData
-
-   data = TSCData.from_arrays(
-       name="my_dataset",
-       split="train",
-       X=X,  # Shape: (n, T) or (n, C, T)
-       y=y,  # Shape: (n,)
-   )
-
-From the UCR Archive
-~~~~~~~~~~~~~~~~~~~~
-
-.. code-block:: python
-
-   from tscf_eval import UCRLoader
-
-   loader = UCRLoader("ItalyPowerDemand")
-   train_data = loader.load("train")
-   test_data = loader.load("test")
-
-   print(train_data.describe())
 
 Next Steps
 ----------

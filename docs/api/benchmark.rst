@@ -151,7 +151,7 @@ Visualization and Analysis Methods
 
    # Create analyzer with metric names (directions are inferred)
    analyzer = ParetoAnalyzer(metrics=[
-       "validity", "proximity_l2", "sparsity", "efficiency_time_s",
+       "validity_soft", "proximity_dtw", "sparsity", "efficiency_time_s",
    ])
 
    # Identify Pareto-optimal methods
@@ -165,8 +165,8 @@ Visualization and Analysis Methods
    # 2D Pareto front plot
    ax = analyzer.plot_front(
        results,
-       x_metric="proximity_l2",
-       y_metric="validity",
+       x_metric="proximity_dtw",
+       y_metric="validity_soft",
        annotate=True,
    )
    plt.savefig("pareto_front.png")
@@ -204,18 +204,18 @@ Min-max normalized weighted composite scoring for ranking methods.
 
    # Equal-weight composite across metrics
    scalarizer = WeightedScalarizer(metrics=[
-       "validity", "proximity_l2", "sparsity",
+       "validity_soft", "proximity_dtw", "sparsity",
    ])
    scores = scalarizer.score(results)
 
    # Custom weights emphasizing validity
    scalarizer = WeightedScalarizer(
-       metrics=["validity", "proximity_l2", "sparsity"],
-       weights={"validity": 3.0, "proximity_l2": 1.0, "sparsity": 1.0},
+       metrics=["validity_soft", "proximity_dtw", "sparsity"],
+       weights={"validity_soft": 3.0, "proximity_dtw": 1.0, "sparsity": 1.0},
    )
 
    # Sensitivity analysis
-   sens_df = scalarizer.sensitivity(results, vary_metric="validity", n_steps=11)
+   sens_df = scalarizer.sensitivity(results, vary_metric="validity_soft", n_steps=11)
    scalarizer.plot_sensitivity(sens_df)
 
 Statistical Testing
@@ -232,7 +232,7 @@ friedman_test
 
    from tscf_eval.benchmark import friedman_test
 
-   fr = friedman_test(results, metric="validity")
+   fr = friedman_test(results, metric="validity_soft")
    print(f"Statistic: {fr.statistic:.3f}, p-value: {fr.p_value:.4f}")
    print(fr.rankings)
 

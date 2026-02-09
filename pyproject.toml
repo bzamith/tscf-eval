@@ -1,6 +1,6 @@
 [project]
 name = "tscf-eval"
-version = "0.1.0"
+version = "1.0.0"
 description = "TSCFEval - A model-agnostic framework for systematic evaluation of counterfactual explanations in time series classification"
 authors = [
     {name = "Bruna Zamith Santos", email = "bzs@cin.ufpe.br"},

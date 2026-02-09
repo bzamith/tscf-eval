@@ -141,23 +141,37 @@ Evaluating Counterfactuals
 
 .. code-block:: python
 
-   import numpy as np
-   from tscf_eval import Evaluator, Validity, Proximity, Sparsity
+   from sklearn.neighbors import KNeighborsClassifier
+   from tscf_eval import (
+       Evaluator, Validity, Proximity, Sparsity,
+       UCRLoader, NativeGuide,
+   )
 
-   # Your data
-   X = np.random.randn(10, 100)       # Original instances
-   X_cf = X + np.random.randn(10, 100) * 0.1  # Counterfactuals
-   y = np.zeros(10)                   # Original labels
-   y_cf = np.ones(10)                 # CF labels
+   # Load data
+   loader = UCRLoader("ItalyPowerDemand")
+   train, test = loader.load("train"), loader.load("test")
 
-   # Create evaluator
+   # Train classifier
+   clf = KNeighborsClassifier(n_neighbors=3)
+   clf.fit(train.X, train.y)
+
+   # Generate counterfactuals using NativeGuide
+   explainer = NativeGuide(clf, (train.X, train.y), method="blend")
+   X, X_cf, y, y_cf = [], [], [], []
+   for x in test.X[:10]:
+       cf, cf_label, _ = explainer.explain(x)
+       X.append(x)
+       X_cf.append(cf)
+       y.append(clf.predict(x.reshape(1, -1))[0])
+       y_cf.append(cf_label)
+
+   # Evaluate counterfactual quality
    evaluator = Evaluator([
        Validity(),
-       Proximity(p=2),
+       Proximity(p=2, distance="lp"),
+       Proximity(distance="dtw"),
        Sparsity(),
    ])
-
-   # Evaluate
    results = evaluator.evaluate(X, X_cf, y=y, y_cf=y_cf)
 
 Contents
