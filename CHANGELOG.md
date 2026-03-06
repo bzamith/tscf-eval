@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 This library is part of the paper: **TSCFEval: A Model-Agnostic Framework for Evaluating Time Series Classification Counterfactuals**, accepted at the XAI World Conference 2026 (Fortaleza, Ceará, Brazil). Published in *Explainable Artificial Intelligence. xAI 2026. Communications in Computer and Information Science. Springer, Cham*.
 
-## [1.0.0] - 2025-03-06
+## [1.0.0] - 2026-03-06
 
 Initial release of TSCFEval.
 
