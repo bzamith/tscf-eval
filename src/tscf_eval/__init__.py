@@ -73,7 +73,7 @@ The counterfactual methods in this package are based on the following papers:
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 __author__ = "Bruna Zamith Santos"
 __email__ = "bruna.zamith@hotmail.com"
 

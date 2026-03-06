@@ -23,8 +23,8 @@ This project follows the [Contributor Covenant Code of Conduct](https://www.cont
 1. **Fork the repository** on GitHub
 2. **Clone your fork** locally:
    ```bash
-   git clone https://github.com/YOUR_USERNAME/tscf.git
-   cd tscf
+   git clone https://github.com/YOUR_USERNAME/tscf-eval.git
+   cd tscf-eval
    ```
 3. **Add the upstream remote**:
    ```bash

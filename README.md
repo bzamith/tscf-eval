@@ -12,7 +12,7 @@ Given a time series classifier and a set of counterfactual explanations, TSCFEva
 - **Confidence-stratified instance selection** for benchmarking across the decision boundary
 - **Three benchmarking scenarios**: single dataset with multiple CF methods, single dataset with multiple classifiers, and multiple datasets with a fixed classifier
 - **7 built-in CF methods** for generating counterfactuals
-- **Multi-criteria analysis** for principled multi-criteria comparison
+- **Pareto and Friedman analysis** for principled multi-criteria comparison
 
 ## Table of Contents
 
@@ -315,12 +315,16 @@ configs = [
 
 If you use TSCFEval in your research, please cite our paper:
 
+> Zamith Santos, B., Andrade Lira, M. F., Cerri, R., & Cavalcante Prudêncio, R. B. (2026). TSCFEval: A Model-Agnostic Framework for Evaluating Time Series Classification Counterfactuals. In *Explainable Artificial Intelligence. xAI 2026. Communications in Computer and Information Science*. Springer, Cham.
+
 ```bibtex
-@inproceedings{santos2025tscfeval,
+@inproceedings{santos2026tscfeval,
   title     = {{TSCFEval}: A Model-Agnostic Framework for Evaluating Time Series Classification Counterfactuals},
-  author    = {Santos, Bruna Zamith and Lira, Maira Farias Andrade and Cerri, Ricardo and Prud{\^{e}}ncio, Ricardo Bastos Cavalcante},
-  year      = {2025},
-  note      = {Under review}
+  author    = {Zamith Santos, Bruna and Andrade Lira, Maira Farias and Cerri, Ricardo and Cavalcante Prud{\^{e}}ncio, Ricardo Bastos},
+  booktitle = {Explainable Artificial Intelligence. xAI 2026},
+  series    = {Communications in Computer and Information Science},
+  publisher = {Springer, Cham},
+  year      = {2026}
 }
 ```
 

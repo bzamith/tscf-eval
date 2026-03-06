@@ -9,6 +9,14 @@ is specifically designed for counterfactual evaluation, consolidating
 fragmented evaluation practices from the TSC counterfactual literature into
 a unified, extensible toolkit.
 
+This library is part of the paper:
+
+    Zamith Santos, B., Andrade Lira, M. F., Cerri, R., & Cavalcante Prudêncio, R. B. (2026).
+    *TSCFEval: A Model-Agnostic Framework for Evaluating Time Series Classification Counterfactuals*.
+    In Explainable Artificial Intelligence. xAI 2026. Communications in Computer and Information Science. Springer, Cham.
+
+Accepted at the **XAI World Conference 2026** (Fortaleza, Ceará, Brazil).
+
 Given a time series classifier and counterfactual explanations, TSCFEval provides:
 
 - **11 evaluation metrics** organized into **six quality dimensions** (core quality, distribution alignment, structural properties, model behavior, stability, and computational performance)
