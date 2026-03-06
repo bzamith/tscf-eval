@@ -29,7 +29,10 @@ extensions = [
 
 # MyST parser settings
 myst_heading_anchors = 3
-suppress_warnings = ["myst.xref_missing"]
+suppress_warnings = [
+    "myst.xref_missing",
+    "docutils",
+]
 
 # Autosummary settings
 autosummary_generate = True
@@ -51,13 +54,16 @@ napoleon_numpy_docstring = True
 napoleon_include_init_with_doc = True
 napoleon_include_private_with_doc = False
 napoleon_include_special_with_doc = True
+
 napoleon_use_admonition_for_examples = True
 napoleon_use_admonition_for_notes = True
 napoleon_use_admonition_for_references = True
+
 napoleon_use_ivar = False
-napoleon_use_param = True
-napoleon_use_rtype = True
-napoleon_type_aliases = None
+napoleon_use_param = False
+napoleon_use_rtype = False
+napoleon_preprocess_types = True
+napoleon_attr_annotations = True
 
 # Intersphinx mapping
 intersphinx_mapping = {
